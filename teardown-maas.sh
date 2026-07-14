@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# teardown-maas.sh
+# Removes all resources created by setup-maas.sh.
+#
+# Usage:
+#   ./teardown-maas.sh [--full] [--yes]
+#
+# Options:
+#   --full  Also uninstall cert-manager and RHCL operators
+#   --yes   Skip the confirmation prompt
+#   --help  Show this message
+
+set -uo pipefail
+
+# ─── Configuration (must match setup-maas.sh) ─────────────────────────────────
+RHOAI_OPERATOR_NS="${RHOAI_OPERATOR_NS:-redhat-ods-operator}"
+RHOAI_APP_NS="${RHOAI_APP_NS:-redhat-ods-applications}"
+CERT_MANAGER_NS="${CERT_MANAGER_NS:-cert-manager-operator}"
+KUADRANT_NS="${KUADRANT_NS:-kuadrant-system}"
+MAAS_MODEL_NS="${MAAS_MODEL_NS:-maas-models}"
+DSC_NAME="${DSC_NAME:-default-dsc}"
+
+FULL=false
+YES=false
+
+# ─── Colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_step()  { echo -e "\n${BOLD}${BLUE}▶ $*${NC}"; }
+log_ok()    { echo -e "${GREEN}✔${NC} $*"; }
+
+# ─── Argument parsing ─────────────────────────────────────────────────────────
+parse_args() {
+  for arg in "$@"; do
+    case "$arg" in
+      --full) FULL=true ;;
+      --yes)  YES=true ;;
+      --help)
+        cat <<'USAGE'
+teardown-maas.sh — Removes all resources created by setup-maas.sh.
+
+Usage:
+  ./teardown-maas.sh [--full] [--yes]
+
+Options:
+  --full  Also uninstall cert-manager and RHCL/Kuadrant operators
+          (Subscriptions, CSVs, OperatorGroups, namespaces)
+  --yes   Skip the confirmation prompt
+  --help  Show this message
+
+Without --full the following are removed:
+  - All LlamaStackDistribution in maas-models
+  - All LLMInferenceService, AuthPolicy, RateLimitPolicy,
+    TokenRateLimitPolicy, and RoleBinding in maas-models
+  - Namespace maas-models
+  - DSC reverted (modelsAsService: Removed)
+  - Gateway maas-default-gateway (openshift-ingress)
+  - Authorino TLS patch reverted; Certificate + ClusterIssuer deleted
+  - PostgreSQL (maas-db namespace + maas-db-config Secret)
+
+Not removed in either mode:
+  - RHOAI operator and DataScienceCluster (pre-existing)
+  - cluster-monitoring-config (may be used by other workloads)
+  - models-as-a-service namespace (RHOAI cleans it up after DSC revert)
+USAGE
+        exit 0 ;;
+      *) log_error "Unknown argument: $arg"; exit 1 ;;
+    esac
+  done
+}
+
+# ─── Confirmation ─────────────────────────────────────────────────────────────
+confirm() {
+  if [[ "$YES" == "true" ]]; then return 0; fi
+  echo
+  echo -e "${YELLOW}${BOLD}WARNING: This will permanently delete MaaS resources.${NC}"
+  echo -e "  Cluster : $(oc whoami --show-server 2>/dev/null || echo '<unknown>')"
+  echo -e "  User    : $(oc whoami 2>/dev/null || echo '<unknown>')"
+  if [[ "$FULL" == "true" ]]; then
+    echo -e "  ${RED}--full: cert-manager and RHCL operators will also be uninstalled.${NC}"
+  fi
+  echo
+  read -rp "Type 'yes' to continue: " answer
+  [[ "$answer" == "yes" ]] || { echo "Aborted."; exit 0; }
+}
+
+# ─── Teardown steps ───────────────────────────────────────────────────────────
+
+delete_model_workloads() {
+  log_step "Deleting model workloads in '${MAAS_MODEL_NS}'"
+  if ! oc get namespace "$MAAS_MODEL_NS" &>/dev/null; then
+    log_warn "Namespace '${MAAS_MODEL_NS}' not found — skipping."
+    return 0
+  fi
+  # Delete workloads first so the controller can clean up dependent resources
+  # (HTTPRoutes, certs) before the namespace is forcibly removed.
+  oc delete llamastackdistribution --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
+  oc delete llminferenceservice --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
+  oc delete authpolicy --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
+  oc delete ratelimitpolicy --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
+  oc delete tokenratelimitpolicy --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
+  oc delete rolebinding --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
+  log_info "Waiting 15 s for controller to clean up dependent resources…"
+  sleep 15
+  oc delete namespace "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
+  log_ok "Namespace '${MAAS_MODEL_NS}' deleted."
+}
+
+revert_dsc() {
+  log_step "Reverting DataScienceCluster MaaS setting to 'Removed'"
+  if ! oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" &>/dev/null; then
+    log_warn "DSC '${DSC_NAME}' not found — skipping."
+    return 0
+  fi
+  oc patch dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    --type=merge \
+    -p '{"spec":{"components":{"kserve":{"modelsAsService":{"managementState":"Removed"}}}}}' \
+    || log_warn "Could not patch DSC — check manually."
+  log_ok "DataScienceCluster modelsAsService set to Removed."
+}
+
+delete_maas_gateway() {
+  log_step "Deleting MaaS gateway"
+  oc delete gateway maas-default-gateway -n openshift-ingress --ignore-not-found 2>/dev/null || true
+  oc delete configmap maas-default-gateway-config -n openshift-ingress --ignore-not-found 2>/dev/null || true
+  log_ok "Gateway 'maas-default-gateway' deleted."
+}
+
+revert_authorino_tls() {
+  log_step "Reverting Authorino TLS"
+  if oc get authorino authorino -n "$KUADRANT_NS" &>/dev/null; then
+    oc patch authorino authorino -n "$KUADRANT_NS" --type=merge \
+      -p '{"spec":{"listener":{"tls":{"enabled":false,"certSecretRef":null}}}}' \
+      2>/dev/null || log_warn "Could not patch Authorino TLS — check manually."
+    log_ok "Authorino TLS disabled."
+  else
+    log_warn "Authorino CR not found — skipping patch."
+  fi
+  oc delete certificate authorino-tls -n "$KUADRANT_NS" --ignore-not-found 2>/dev/null || true
+  oc delete secret authorino-tls-secret -n "$KUADRANT_NS" --ignore-not-found 2>/dev/null || true
+  oc delete clusterissuer maas-self-signed --ignore-not-found 2>/dev/null || true
+  log_ok "Authorino TLS cert resources deleted."
+}
+
+delete_postgresql() {
+  log_step "Deleting PostgreSQL"
+  oc delete secret maas-db-config -n "$RHOAI_APP_NS" --ignore-not-found 2>/dev/null || true
+  oc delete namespace maas-db --ignore-not-found 2>/dev/null || true
+  log_ok "PostgreSQL namespace 'maas-db' deleted."
+}
+
+delete_cert_manager() {
+  log_step "Removing cert-manager operator"
+  local csv
+  csv=$(oc get csv -n "$CERT_MANAGER_NS" 2>/dev/null | awk '/cert-manager/{print $1}' | head -1)
+  [[ -n "$csv" ]] && oc delete csv "$csv" -n "$CERT_MANAGER_NS" --ignore-not-found 2>/dev/null || true
+  oc delete subscription openshift-cert-manager-operator -n "$CERT_MANAGER_NS" --ignore-not-found 2>/dev/null || true
+  oc delete operatorgroup -n "$CERT_MANAGER_NS" --all --ignore-not-found 2>/dev/null || true
+  oc delete namespace "$CERT_MANAGER_NS" --ignore-not-found 2>/dev/null || true
+  log_ok "cert-manager operator removed."
+}
+
+delete_rhcl() {
+  log_step "Removing RHCL/Kuadrant operator"
+  oc delete kuadrant kuadrant -n "$KUADRANT_NS" --ignore-not-found 2>/dev/null || true
+  local csv
+  csv=$(oc get csv -n openshift-operators 2>/dev/null | awk '/rhcl/{print $1}' | head -1)
+  [[ -n "$csv" ]] && oc delete csv "$csv" -n openshift-operators --ignore-not-found 2>/dev/null || true
+  oc delete subscription rhcl-operator -n openshift-operators --ignore-not-found 2>/dev/null || true
+  oc delete namespace "$KUADRANT_NS" --ignore-not-found 2>/dev/null || true
+  log_ok "RHCL/Kuadrant operator removed."
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+main() {
+  parse_args "$@"
+
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}${CYAN}║          RHOAI 3.4 MaaS — Teardown                          ║${NC}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+
+  confirm
+
+  delete_model_workloads   # delete workloads before reverting DSC so controller can clean up
+  revert_dsc
+  delete_maas_gateway
+  revert_authorino_tls
+  delete_postgresql
+
+  if [[ "$FULL" == "true" ]]; then
+    delete_cert_manager
+    delete_rhcl
+  fi
+
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}${CYAN}║                    Teardown complete                         ║${NC}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+  echo
+  if [[ "$FULL" != "true" ]]; then
+    log_info "cert-manager and RHCL operators were left in place (pass --full to remove them)."
+  fi
+  log_warn "'cluster-monitoring-config' in openshift-monitoring was not removed"
+  log_warn "  (may be used by other workloads — delete manually if needed)."
+  log_warn "'models-as-a-service' namespace will be cleaned up by RHOAI after DSC reconciles."
+}
+
+main "$@"

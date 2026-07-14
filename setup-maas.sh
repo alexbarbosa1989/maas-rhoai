@@ -1,0 +1,756 @@
+#!/usr/bin/env bash
+# setup-maas.sh
+# Automates the configuration of Models-as-a-Service (MaaS) on Red Hat OpenShift AI 3.4.
+# Reference: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html-single/govern_llm_access_with_models-as-a-service/index
+#
+# Usage:
+#   ./setup-maas.sh [--skip-operators] [--deploy-example] [--help]
+#
+# Options:
+#   --skip-operators   Skip cert-manager and RHCL operator installation (use if already installed)
+#   --deploy-example   Also apply the example LLMInferenceService and governance policies
+#   --help             Show this message
+
+set -uo pipefail
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+RHOAI_OPERATOR_NS="${RHOAI_OPERATOR_NS:-redhat-ods-operator}"
+RHOAI_APP_NS="${RHOAI_APP_NS:-redhat-ods-applications}"
+CERT_MANAGER_NS="${CERT_MANAGER_NS:-cert-manager-operator}"
+KUADRANT_NS="${KUADRANT_NS:-kuadrant-system}"
+MAAS_MODEL_NS="${MAAS_MODEL_NS:-maas-models}"
+DSC_NAME="${DSC_NAME:-default-dsc}"
+DSCI_NAME="${DSCI_NAME:-default-dsci}"
+
+OPERATOR_WAIT_TIMEOUT="${OPERATOR_WAIT_TIMEOUT:-600}"   # seconds
+POD_WAIT_TIMEOUT="${POD_WAIT_TIMEOUT:-300}"             # seconds
+KUADRANT_WAIT_TIMEOUT="${KUADRANT_WAIT_TIMEOUT:-300}"   # seconds
+
+MANIFESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/manifests"
+
+SKIP_OPERATORS=false
+SKIP_CERT_MANAGER=false
+SKIP_RHCL=false
+DEPLOY_EXAMPLE=false
+
+# ─── Colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_step()  { echo -e "\n${BOLD}${BLUE}▶ $*${NC}"; }
+log_ok()    { echo -e "${GREEN}✔${NC} $*"; }
+
+# ─── Argument parsing ─────────────────────────────────────────────────────────
+parse_args() {
+  for arg in "$@"; do
+    case "$arg" in
+      --skip-operators)   SKIP_OPERATORS=true ;;
+      --skip-cert-manager) SKIP_CERT_MANAGER=true ;;
+      --skip-rhcl)        SKIP_RHCL=true ;;
+      --deploy-example)   DEPLOY_EXAMPLE=true ;;
+      --help)
+        cat <<'USAGE'
+setup-maas.sh — Automates MaaS configuration on Red Hat OpenShift AI 3.4.
+Reference: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html-single/govern_llm_access_with_models-as-a-service/index
+
+Usage:
+  ./setup-maas.sh [OPTIONS]
+
+Options:
+  --skip-operators    Skip both cert-manager and RHCL installation
+  --skip-cert-manager Skip cert-manager installation only
+  --skip-rhcl         Skip RHCL/Kuadrant installation only
+  --deploy-example    Also apply example LLMInferenceService and governance policies
+  --help              Show this message
+
+Note: Each operator step auto-detects whether it is already installed by checking
+for its CRDs (certificates.cert-manager.io, kuadrants.kuadrant.io). The --skip-*
+flags force-bypass even that detection.
+
+Environment variables (all optional, shown with defaults):
+  RHOAI_OPERATOR_NS=redhat-ods-operator   RHOAI_APP_NS=redhat-ods-applications
+  CERT_MANAGER_NS=cert-manager-operator   KUADRANT_NS=kuadrant-system
+  MAAS_MODEL_NS=maas-models               DSC_NAME=default-dsc
+  OPERATOR_WAIT_TIMEOUT=600               POD_WAIT_TIMEOUT=300
+USAGE
+        exit 0 ;;
+      *) log_error "Unknown argument: $arg"; exit 1 ;;
+    esac
+  done
+}
+
+# ─── Utility functions ────────────────────────────────────────────────────────
+
+# approve_installplan_for_sub NAMESPACE SUBSCRIPTION_NAME
+# Finds the InstallPlan referenced by a subscription and approves it if Manual.
+# Handles clusters where OLM overrides Automatic to Manual (e.g. via admission webhooks).
+approve_installplan_for_sub() {
+  local ns="$1" sub="$2"
+  local deadline=$(( $(date +%s) + 120 ))
+  log_info "Checking InstallPlan approval for subscription '${sub}' in '${ns}'…"
+  while true; do
+    local plan_name
+    plan_name=$(oc get subscription "$sub" -n "$ns" \
+      -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null)
+    if [[ -n "$plan_name" ]]; then
+      local approved
+      approved=$(oc get installplan "$plan_name" -n "$ns" \
+        -o jsonpath='{.spec.approved}' 2>/dev/null)
+      if [[ "$approved" != "true" ]]; then
+        local csvs
+        csvs=$(oc get installplan "$plan_name" -n "$ns" \
+          -o jsonpath='{.spec.clusterServiceVersionNames}' 2>/dev/null)
+        log_info "Approving InstallPlan '${plan_name}' (CSVs: ${csvs})…"
+        oc patch installplan "$plan_name" -n "$ns" \
+          --type=merge -p '{"spec":{"approved":true}}'
+        log_ok "InstallPlan '${plan_name}' approved."
+      else
+        log_ok "InstallPlan '${plan_name}' already approved."
+      fi
+      return 0
+    fi
+    if (( $(date +%s) > deadline )); then
+      log_warn "No InstallPlan found for subscription '${sub}' in '${ns}' after 120s — continuing."
+      return 0
+    fi
+    sleep 5
+  done
+}
+
+# wait_for_csv NAMESPACE PACKAGE TIMEOUT_SECS
+# Polls until an operator's ClusterServiceVersion reaches Succeeded phase.
+wait_for_csv() {
+  local ns="$1" pkg="$2" timeout="$3"
+  local deadline=$(( $(date +%s) + timeout ))
+  log_info "Waiting for CSV '${pkg}' in namespace '${ns}' (timeout: ${timeout}s)…"
+  while true; do
+    local phase
+    phase=$(oc get csv -n "$ns" 2>/dev/null \
+      | awk -v p="$pkg" '$1 ~ p {print $NF}' | head -1)
+    if [[ "$phase" == "Succeeded" ]]; then
+      log_ok "CSV '${pkg}' is Succeeded."
+      return 0
+    fi
+    if (( $(date +%s) > deadline )); then
+      log_error "Timed out waiting for CSV '${pkg}' (last phase: '${phase:-not found}')."
+      oc get csv -n "$ns" 2>/dev/null
+      return 1
+    fi
+    sleep 10
+  done
+}
+
+# wait_for_condition RESOURCE NAMESPACE CONDITION TIMEOUT_SECS
+# Waits until a resource's .status.conditions contains condition=True.
+wait_for_condition() {
+  local resource="$1" ns="$2" condition="$3" timeout="$4"
+  local deadline=$(( $(date +%s) + timeout ))
+  log_info "Waiting for '${resource}' in '${ns}' to reach condition '${condition}'…"
+  while true; do
+    local status
+    status=$(oc get "$resource" -n "$ns" \
+      -o jsonpath="{.status.conditions[?(@.type==\"${condition}\")].status}" 2>/dev/null)
+    if [[ "$status" == "True" ]]; then
+      log_ok "'${resource}' condition '${condition}' is True."
+      return 0
+    fi
+    if (( $(date +%s) > deadline )); then
+      log_error "Timed out waiting for '${resource}' condition '${condition}' (status='${status}')."
+      oc describe "$resource" -n "$ns" 2>/dev/null | tail -20
+      return 1
+    fi
+    sleep 10
+  done
+}
+
+# wait_for_pods NAMESPACE LABEL TIMEOUT_SECS
+# Waits until at least one pod matching the label selector is Running.
+wait_for_pods() {
+  local ns="$1" selector="$2" timeout="$3"
+  local deadline=$(( $(date +%s) + timeout ))
+  log_info "Waiting for pods (selector='${selector}') in '${ns}'…"
+  while true; do
+    local running
+    running=$(oc get pods -n "$ns" -l "$selector" \
+      --field-selector=status.phase=Running 2>/dev/null | grep -c Running || true)
+    if (( running > 0 )); then
+      log_ok "${running} pod(s) Running in '${ns}' (selector='${selector}')."
+      return 0
+    fi
+    # Fail fast on unrecoverable image pull errors rather than waiting the full timeout.
+    local pull_err
+    pull_err=$(oc get pods -n "$ns" -l "$selector" 2>/dev/null \
+      | grep -c "ImagePullBackOff\|ErrImagePull" || true)
+    if (( pull_err > 0 )); then
+      log_error "Image pull failed for pods (selector='${selector}') in '${ns}':"
+      oc get pods -n "$ns" -l "$selector" 2>/dev/null
+      oc describe pod -n "$ns" -l "$selector" 2>/dev/null \
+        | grep -A5 "Events:" | tail -10
+      return 1
+    fi
+    if (( $(date +%s) > deadline )); then
+      log_error "Timed out waiting for pods (selector='${selector}') in '${ns}'."
+      oc get pods -n "$ns" -l "$selector" 2>/dev/null
+      return 1
+    fi
+    sleep 10
+  done
+}
+
+# apply_manifest FILE
+# Applies a manifest. Silences "already exists" warnings (idempotent).
+apply_manifest() {
+  local file="$1"
+  local out
+  if out=$(oc apply -f "$file" 2>&1); then
+    echo "$out"
+    return 0
+  fi
+  if echo "$out" | grep -q "already exists"; then
+    log_warn "Already exists (skipping): ${file##*/}"
+    return 0
+  fi
+  log_error "Failed to apply '${file##*/}': ${out}"
+  return 1
+}
+
+# resource_exists KIND NAME NAMESPACE
+resource_exists() {
+  oc get "$1" "$2" ${3:+-n "$3"} &>/dev/null
+}
+
+# ─── Steps ────────────────────────────────────────────────────────────────────
+
+check_prerequisites() {
+  log_step "Step 1: Checking prerequisites"
+
+  # oc CLI
+  if ! command -v oc &>/dev/null; then
+    log_error "'oc' CLI not found. Install OpenShift CLI and retry."
+    exit 1
+  fi
+  log_ok "oc CLI found: $(oc version --client 2>/dev/null | head -1)"
+
+  # Cluster connectivity
+  if ! oc whoami &>/dev/null; then
+    log_error "Not logged in to an OpenShift cluster. Run 'oc login …' first."
+    exit 1
+  fi
+  log_ok "Logged in as: $(oc whoami) on $(oc whoami --show-server)"
+
+  # cluster-admin
+  if ! oc auth can-i create clusterrole --all-namespaces &>/dev/null; then
+    log_error "Current user does not have cluster-admin privileges."
+    exit 1
+  fi
+  log_ok "cluster-admin privileges confirmed."
+
+  # RHOAI operator
+  local rhoai_csv
+  rhoai_csv=$(oc get csv -n "$RHOAI_OPERATOR_NS" 2>/dev/null \
+    | awk '/rhods-operator/{print $1}' | head -1)
+  if [[ -z "$rhoai_csv" ]]; then
+    log_error "Red Hat OpenShift AI operator not found in namespace '${RHOAI_OPERATOR_NS}'."
+    log_error "Install RHOAI 3.4 before running this script."
+    exit 1
+  fi
+  local rhoai_version
+  rhoai_version=$(echo "$rhoai_csv" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+  log_ok "RHOAI operator found: ${rhoai_csv} (version ${rhoai_version})"
+
+  # RHOAI minimum version check (3.4)
+  local major minor
+  major=$(echo "$rhoai_version" | cut -d. -f1)
+  minor=$(echo "$rhoai_version" | cut -d. -f2)
+  if (( major < 3 || (major == 3 && minor < 4) )); then
+    log_error "MaaS with LLMInferenceService requires RHOAI >= 3.4 (found ${rhoai_version})."
+    exit 1
+  fi
+
+  # DSC exists
+  if ! resource_exists dsc "$DSC_NAME" "$RHOAI_OPERATOR_NS"; then
+    log_error "DataScienceCluster '${DSC_NAME}' not found in '${RHOAI_OPERATOR_NS}'."
+    exit 1
+  fi
+  log_ok "DataScienceCluster '${DSC_NAME}' exists."
+
+  # Manifests directory
+  if [[ ! -d "$MANIFESTS_DIR" ]]; then
+    log_error "Manifests directory not found: ${MANIFESTS_DIR}"
+    exit 1
+  fi
+  log_ok "Manifests directory found: ${MANIFESTS_DIR}"
+}
+
+install_cert_manager() {
+  log_step "Step 2: Installing cert-manager operator"
+
+  # Detect by CSV — CRD alone is not enough (OLM leaves CRDs behind after uninstall).
+  local phase
+  phase=$(oc get csv -A 2>/dev/null | awk '/cert-manager-operator/{print $NF}' | head -1)
+  if [[ "$phase" == "Succeeded" ]]; then
+    log_ok "cert-manager already installed and CSV is Succeeded — skipping."
+    return 0
+  fi
+  [[ -n "$phase" ]] && log_warn "cert-manager CSV found but phase is '${phase}' — reinstalling."
+
+  apply_manifest "${MANIFESTS_DIR}/01-cert-manager-namespace.yaml"
+  apply_manifest "${MANIFESTS_DIR}/02-cert-manager-operatorgroup.yaml"
+  apply_manifest "${MANIFESTS_DIR}/03-cert-manager-subscription.yaml"
+
+  approve_installplan_for_sub "$CERT_MANAGER_NS" "openshift-cert-manager-operator"
+
+  wait_for_csv "$CERT_MANAGER_NS" "cert-manager-operator" "$OPERATOR_WAIT_TIMEOUT" \
+    || { log_error "cert-manager CSV failed. Aborting."; exit 1; }
+
+  wait_for_pods "cert-manager" "app.kubernetes.io/instance=cert-manager" "$POD_WAIT_TIMEOUT" \
+    || { log_error "cert-manager pods not running. Aborting."; exit 1; }
+  log_ok "cert-manager operator is ready."
+}
+
+install_rhcl() {
+  log_step "Step 3: Installing Red Hat Connectivity Link (RHCL) operator"
+
+  # Detect by CSV — CRD alone is not enough (OLM leaves CRDs behind after uninstall).
+  local phase
+  phase=$(oc get csv -n openshift-operators 2>/dev/null | awk '/rhcl/{print $NF}' | head -1)
+  if [[ "$phase" == "Succeeded" ]]; then
+    log_ok "RHCL already installed and CSV is Succeeded — skipping."
+  else
+    [[ -n "$phase" ]] && log_warn "RHCL CSV found but phase is '${phase}' — reinstalling."
+    apply_manifest "${MANIFESTS_DIR}/04-rhcl-subscription.yaml"
+    # RHCL bundles sub-operators (Authorino, Limitador, dns-operator, Service Mesh upgrade).
+    # OLM may create the InstallPlan as Manual even when subscription requests Automatic.
+    approve_installplan_for_sub "openshift-operators" "rhcl-operator"
+    wait_for_csv "openshift-operators" "rhcl-operator" "$OPERATOR_WAIT_TIMEOUT" \
+      || { log_error "RHCL CSV failed. Aborting."; exit 1; }
+    log_ok "RHCL operator CSV is Succeeded."
+
+    log_info "Waiting for Kuadrant CRD to be registered…"
+    local crd_deadline=$(( $(date +%s) + 120 ))
+    until oc get crd kuadrants.kuadrant.io &>/dev/null; do
+      if (( $(date +%s) > crd_deadline )); then
+        log_error "Kuadrant CRD not available after 120s. RHCL may not have installed correctly."
+        oc get csv -n openshift-operators 2>/dev/null | grep -E "rhcl|kuadrant|authorino|limitador"
+        exit 1
+      fi
+      sleep 5
+    done
+    log_ok "Kuadrant CRD is available."
+  fi
+
+  # Namespace + CR creation always runs — both are idempotent.
+  apply_manifest "${MANIFESTS_DIR}/05-kuadrant-namespace.yaml"
+
+  if resource_exists kuadrant kuadrant "$KUADRANT_NS"; then
+    log_warn "Kuadrant CR already exists — skipping creation."
+  else
+    apply_manifest "${MANIFESTS_DIR}/06-kuadrant-cr.yaml"
+    log_info "Kuadrant CR created. Waiting for sub-components to start…"
+  fi
+
+  wait_for_condition "kuadrant/kuadrant" "$KUADRANT_NS" "Ready" "$KUADRANT_WAIT_TIMEOUT" \
+    || { log_error "Kuadrant not Ready. Aborting."; exit 1; }
+  log_ok "Kuadrant is Ready in '${KUADRANT_NS}'."
+}
+
+configure_maas_gateway() {
+  log_step "Step 4: Creating MaaS Gateway API gateway"
+  # The maas-controller's default-tenant expects a Gateway named maas-default-gateway
+  # in openshift-ingress. RHOAI does not create it automatically.
+
+  if resource_exists gateway maas-default-gateway "openshift-ingress"; then
+    log_warn "Gateway 'maas-default-gateway' already exists — skipping."
+  else
+    apply_manifest "${MANIFESTS_DIR}/06b-maas-gateway-configmap.yaml"
+    apply_manifest "${MANIFESTS_DIR}/06c-maas-gateway.yaml"
+    log_info "Waiting for Gateway 'maas-default-gateway' to be Programmed…"
+    local deadline=$(( $(date +%s) + 120 ))
+    until [[ "$(oc get gateway maas-default-gateway -n openshift-ingress \
+                  -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null)" == "True" ]]; do
+      if (( $(date +%s) > deadline )); then
+        log_error "Gateway 'maas-default-gateway' not Programmed after 120s."
+        oc describe gateway maas-default-gateway -n openshift-ingress 2>/dev/null | tail -15
+        exit 1
+      fi
+      sleep 5
+    done
+    log_ok "Gateway 'maas-default-gateway' is Programmed."
+  fi
+}
+
+configure_authorino_tls() {
+  log_step "Step 5: Configuring Authorino TLS (required by MaaS auth layer)"
+
+  if oc get authorino authorino -n "$KUADRANT_NS" \
+      -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null | grep -q "true"; then
+    log_warn "Authorino TLS already enabled — skipping."
+    return 0
+  fi
+
+  apply_manifest "${MANIFESTS_DIR}/06e-authorino-tls.yaml"
+
+  log_info "Waiting for Authorino TLS Secret to be issued by cert-manager…"
+  local deadline=$(( $(date +%s) + 120 ))
+  until oc get secret authorino-tls-secret -n "$KUADRANT_NS" &>/dev/null; do
+    if (( $(date +%s) > deadline )); then
+      log_error "Authorino TLS Secret not issued after 120s."
+      oc describe certificate authorino-tls -n "$KUADRANT_NS" 2>/dev/null | tail -10
+      exit 1
+    fi
+    sleep 5
+  done
+  log_ok "Authorino TLS Secret issued."
+
+  oc patch authorino authorino -n "$KUADRANT_NS" --type=merge -p '{
+    "spec": {
+      "listener": {
+        "tls": {
+          "enabled": true,
+          "certSecretRef": {"name": "authorino-tls-secret"}
+        }
+      }
+    }
+  }'
+  log_ok "Authorino patched with TLS configuration."
+  # Use rollout status rather than pod polling — the patch triggers a rolling restart,
+  # so there is a window where the old pod is terminating and the new one hasn't appeared
+  # yet; wait_for_pods would see 0 running pods and time out prematurely.
+  log_info "Waiting for Authorino deployment rollout to complete…"
+  oc rollout status deployment/authorino -n "$KUADRANT_NS" \
+    --timeout="${POD_WAIT_TIMEOUT}s" \
+    || { log_error "Authorino deployment rollout failed. Aborting."; exit 1; }
+  log_ok "Authorino is Running with TLS enabled."
+}
+
+deploy_postgresql() {
+  log_step "Step 6: Deploying PostgreSQL for MaaS API"
+
+  # Check the StatefulSet (the workload), not the Secret — the Secret can exist
+  # without the StatefulSet if it was manually deleted, which would be a silent failure.
+  if resource_exists statefulset maas-postgresql "maas-db"; then
+    log_warn "StatefulSet 'maas-postgresql' already exists — skipping PostgreSQL deployment."
+    # Ensure the DB config Secret is present even if somehow missing.
+    if ! resource_exists secret maas-db-config "$RHOAI_APP_NS"; then
+      log_warn "Secret 'maas-db-config' missing — re-applying manifest to restore it."
+      apply_manifest "${MANIFESTS_DIR}/06d-maas-postgresql.yaml"
+    fi
+    return 0
+  fi
+
+  apply_manifest "${MANIFESTS_DIR}/06d-maas-postgresql.yaml"
+
+  wait_for_pods "maas-db" "app=maas-postgresql" "$POD_WAIT_TIMEOUT" \
+    || { log_error "PostgreSQL pod not Running. Aborting."; exit 1; }
+  log_ok "PostgreSQL is Running and 'maas-db-config' Secret created."
+}
+
+configure_monitoring() {
+  log_step "Step 7: Enabling User Workload Monitoring"
+
+  if resource_exists configmap cluster-monitoring-config "openshift-monitoring"; then
+    log_warn "cluster-monitoring-config already exists — skipping."
+    return 0
+  fi
+
+  apply_manifest "${MANIFESTS_DIR}/06f-user-workload-monitoring.yaml"
+  log_ok "User Workload Monitoring enabled."
+}
+
+enable_maas_in_dsc() {
+  log_step "Step 8: Enabling MaaS (modelsAsService) in the DataScienceCluster"
+
+  local current_state
+  current_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    -o jsonpath='{.spec.components.kserve.modelsAsService.managementState}' 2>/dev/null)
+
+  if [[ "$current_state" == "Managed" ]]; then
+    log_warn "modelsAsService is already Managed — skipping patch."
+    return 0
+  fi
+
+  log_info "Current modelsAsService.managementState: '${current_state:-unset}' → Managed"
+  oc patch dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    --type=merge \
+    -p '{"spec":{"components":{"kserve":{"modelsAsService":{"managementState":"Managed"}}}}}'
+
+  log_info "Waiting for DataScienceCluster to reconcile…"
+  local deadline=$(( $(date +%s) + OPERATOR_WAIT_TIMEOUT ))
+  local dashboard_fix_applied=false
+  while true; do
+    local ready
+    ready=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+    if [[ "$ready" == "True" ]]; then
+      log_ok "DataScienceCluster '${DSC_NAME}' is Ready."
+      break
+    fi
+
+    # Detect Dashboard rolling-update deadlock: happens on resource-constrained nodes where
+    # maxUnavailable=0 (25% of 2 rounds down) prevents terminating an old pod to free CPU
+    # for the new one. Fix: switch to maxUnavailable=1, maxSurge=0 so old pod is killed first.
+    if [[ "$dashboard_fix_applied" == "false" ]]; then
+      local dash_ready
+      dash_ready=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+        -o jsonpath='{.status.conditions[?(@.type=="DashboardReady")].status}' 2>/dev/null)
+      if [[ "$dash_ready" == "False" ]]; then
+        local dash_progressing
+        dash_progressing=$(oc get deployment rhods-dashboard -n "$RHOAI_APP_NS" \
+          -o jsonpath='{.status.conditions[?(@.type=="Progressing")].reason}' 2>/dev/null)
+        if [[ "$dash_progressing" == "ProgressDeadlineExceeded" ]]; then
+          log_warn "Dashboard rollout deadlocked (ProgressDeadlineExceeded) — likely insufficient CPU headroom for rolling update on this node."
+          log_warn "Applying fix: maxUnavailable=1, maxSurge=0 to allow old pod to be replaced first."
+          oc patch deployment rhods-dashboard -n "$RHOAI_APP_NS" --type=merge \
+            -p '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":1,"maxSurge":0}}}}' \
+            && dashboard_fix_applied=true \
+            || log_warn "Could not patch Dashboard deployment strategy — will keep waiting."
+        fi
+      fi
+    fi
+
+    if (( $(date +%s) > deadline )); then
+      log_error "Timed out waiting for DSC to become Ready."
+      oc describe dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" 2>/dev/null | tail -30
+      return 1
+    fi
+    sleep 10
+  done
+
+  # Verify MaaS dependency warning is informational only (cert-manager + RHCL are now installed)
+  local maas_cond
+  maas_cond=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    -o jsonpath='{.status.conditions[?(@.type=="KserveLLMInferenceServiceDependencies")].status}' \
+    2>/dev/null)
+  if [[ "$maas_cond" == "True" ]]; then
+    log_ok "KserveLLMInferenceServiceDependencies condition is True — all dependencies met."
+  else
+    local msg
+    msg=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      -o jsonpath='{.status.conditions[?(@.type=="KserveLLMInferenceServiceDependencies")].message}' \
+      2>/dev/null)
+    log_warn "KserveLLMInferenceServiceDependencies: ${msg:-unknown}."
+    log_warn "Continuing — this may resolve as operators finish initialising."
+  fi
+}
+
+verify_maas_components() {
+  log_step "Step 9: Verifying all MaaS platform components"
+
+  # model-serving-api — LLM catalogue REST API
+  wait_for_pods "$RHOAI_APP_NS" "app.kubernetes.io/name=model-serving-api" "$POD_WAIT_TIMEOUT"
+
+  # llmisvc-controller-manager — reconciles LLMInferenceService resources
+  wait_for_pods "$RHOAI_APP_NS" "control-plane=llmisvc-controller-manager" "$POD_WAIT_TIMEOUT"
+
+  # maas-api — MaaS platform API (needs PostgreSQL to be up first)
+  wait_for_pods "$RHOAI_APP_NS" "app.kubernetes.io/name=maas-api" "$POD_WAIT_TIMEOUT" \
+    || { log_error "maas-api pod not Running. Check PostgreSQL connectivity."; exit 1; }
+
+  # maas-controller — manages Tenant, MaaSAuthPolicy, etc.
+  wait_for_pods "$RHOAI_APP_NS" "control-plane=maas-controller" "$POD_WAIT_TIMEOUT"
+
+  # GatewayConfig should be Ready
+  wait_for_condition "gatewayconfig/default-gateway" "$RHOAI_APP_NS" \
+    "GatewayConfigReady" "$POD_WAIT_TIMEOUT"
+
+  # Final: DSC ModelsAsServiceReady
+  wait_for_condition "dsc/${DSC_NAME}" "$RHOAI_OPERATOR_NS" \
+    "ModelsAsServiceReady" "$POD_WAIT_TIMEOUT" \
+    || { log_error "ModelsAsServiceReady never reached True. Check maas-controller logs."; exit 1; }
+
+  local domain
+  domain=$(oc get gatewayconfig default-gateway -n "$RHOAI_APP_NS" \
+    -o jsonpath='{.status.domain}' 2>/dev/null)
+  log_ok "MaaS gateway domain: ${domain}"
+  echo "$domain"
+}
+
+create_model_namespace() {
+  log_step "Step 10: Creating MaaS model namespace '${MAAS_MODEL_NS}'"
+
+  if resource_exists namespace "$MAAS_MODEL_NS"; then
+    log_warn "Namespace '${MAAS_MODEL_NS}' already exists — skipping."
+  else
+    apply_manifest "${MANIFESTS_DIR}/07-model-namespace.yaml"
+    log_ok "Namespace '${MAAS_MODEL_NS}' created."
+  fi
+
+  # Patch namespace name in YAML uses the variable; no further action needed.
+  log_info "To deploy models, create LLMInferenceService resources in '${MAAS_MODEL_NS}'."
+  log_info "See: ${MANIFESTS_DIR}/08-example-llminferenceservice.yaml"
+}
+
+deploy_example() {
+  log_step "Step 11 (optional): Deploying example LLMInferenceService and governance policies"
+  log_warn "Applying example resources from manifests/08–12."
+  log_warn "The example uses llama-3.1-8B-Instruct FP8 from registry.redhat.io (RHEL AI 1.5 modelcar)."
+  log_warn "Actual pod scheduling requires a GPU node with FP8 support (NVIDIA H100/H200 recommended)."
+
+  apply_manifest "${MANIFESTS_DIR}/08-example-llminferenceservice.yaml"
+  apply_manifest "${MANIFESTS_DIR}/09-example-auth-policy.yaml"
+  apply_manifest "${MANIFESTS_DIR}/10-example-ratelimit-policy.yaml"
+  apply_manifest "${MANIFESTS_DIR}/11-example-token-ratelimit-policy.yaml"
+  apply_manifest "${MANIFESTS_DIR}/12-example-rbac-viewer.yaml"
+
+  log_info "Waiting for LLMInferenceService to initialise (may take several minutes)…"
+  local deadline=$(( $(date +%s) + 600 ))
+  while true; do
+    local ready
+    ready=$(oc get llminferenceservice llama-3-8b -n "$MAAS_MODEL_NS" \
+      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+    if [[ "$ready" == "True" ]]; then
+      log_ok "LLMInferenceService 'llama-3-8b' is Ready."
+      break
+    fi
+    if (( $(date +%s) > deadline )); then
+      log_warn "LLMInferenceService not Ready within 10 minutes — check pod status:"
+      oc get pods -n "$MAAS_MODEL_NS" 2>/dev/null
+      log_warn "Continuing with summary…"
+      break
+    fi
+    sleep 15
+  done
+}
+
+print_summary() {
+  log_step "Setup complete — Summary"
+
+  local domain
+  domain=$(oc get gatewayconfig default-gateway -n "$RHOAI_APP_NS" \
+    -o jsonpath='{.status.domain}' 2>/dev/null || echo "<domain>")
+
+  local maas_state
+  maas_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    -o jsonpath='{.spec.components.kserve.modelsAsService.managementState}' 2>/dev/null)
+
+  local kuadrant_ready
+  kuadrant_ready=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "N/A")
+
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}${CYAN}║          RHOAI 3.4 MaaS — Configuration Summary              ║${NC}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+  echo
+  echo -e "  ${BOLD}Component${NC}                          ${BOLD}Status${NC}"
+  echo -e "  ─────────────────────────────────────────────────────"
+  local maas_api_ready maas_gw_prog maas_ready
+  maas_api_ready=$(oc get pods -n "$RHOAI_APP_NS" -l "app.kubernetes.io/name=maas-api" \
+    --field-selector=status.phase=Running 2>/dev/null | grep -c Running || echo 0)
+  maas_gw_prog=$(oc get gateway maas-default-gateway -n openshift-ingress \
+    -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || echo "N/A")
+  maas_ready=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    -o jsonpath='{.status.conditions[?(@.type=="ModelsAsServiceReady")].status}' 2>/dev/null || echo "N/A")
+
+  echo -e "  cert-manager operator              $(oc get csv -n "$CERT_MANAGER_NS" 2>/dev/null | awk '/cert-manager/{print $NF}' | head -1 || echo 'N/A')"
+  echo -e "  RHCL operator                      $(oc get csv -n openshift-operators 2>/dev/null | awk '/rhcl/{print $NF}' | head -1 || echo 'N/A')"
+  echo -e "  Kuadrant (kuadrant-system)         Ready=${kuadrant_ready}"
+  echo -e "  MaaS Gateway (openshift-ingress)   Programmed=${maas_gw_prog}"
+  echo -e "  Authorino TLS                      $(oc get authorino authorino -n "$KUADRANT_NS" -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || echo 'N/A')"
+  echo -e "  PostgreSQL (maas-db)               $(oc get pods -n maas-db -l app=maas-postgresql --field-selector=status.phase=Running 2>/dev/null | grep -c Running || echo 0) pod(s) Running"
+  echo -e "  maas-api                           ${maas_api_ready} pod(s) Running"
+  echo -e "  ModelsAsServiceReady               ${maas_ready}"
+  echo -e "  modelsAsService                    ${maas_state}"
+  echo -e "  GatewayConfig domain               ${domain}"
+  echo -e "  Model namespace                    ${MAAS_MODEL_NS}"
+  echo
+  local gpu_profile
+  gpu_profile=$(oc get hardwareprofile -n "$RHOAI_APP_NS" -o json 2>/dev/null \
+    | python3 -c "
+import json,sys
+profiles = json.load(sys.stdin).get('items', [])
+for p in profiles:
+    ids = p.get('spec', {}).get('identifiers', [])
+    if any(i.get('identifier') == 'nvidia.com/gpu' for i in ids):
+        print(p['metadata']['name'])
+        break
+" 2>/dev/null || echo "")
+
+  echo -e "  ${BOLD}Next steps:${NC}"
+  if [[ -n "$gpu_profile" ]]; then
+    echo -e "  GPU HardwareProfile detected: ${BOLD}${gpu_profile}${NC}"
+    echo -e "  Update manifests/08-example-llminferenceservice.yaml if needed:"
+    echo -e "    opendatahub.io/hardware-profile-name: ${gpu_profile}"
+    echo
+  else
+    echo -e "  ${YELLOW}[WARN]${NC}  No GPU HardwareProfile found in '${RHOAI_APP_NS}'."
+    echo -e "  Create one in the RHOAI dashboard before deploying a model."
+    echo
+  fi
+  echo -e "  1. Deploy an LLMInferenceService in namespace '${MAAS_MODEL_NS}':"
+  echo -e "     oc apply -f manifests/08-example-llminferenceservice.yaml"
+  echo
+  echo -e "  2. Apply governance policies (after HTTPRoute is created by the controller):"
+  echo -e "     oc apply -f manifests/09-example-auth-policy.yaml"
+  echo -e "     oc apply -f manifests/10-example-ratelimit-policy.yaml"
+  echo -e "     oc apply -f manifests/11-example-token-ratelimit-policy.yaml"
+  echo
+  echo -e "  3. Grant user/group access to the model namespace:"
+  echo -e "     oc apply -f manifests/12-example-rbac-viewer.yaml"
+  echo
+  echo -e "  4. (Optional) Deploy LlamaStack for the RHOAI GenAI Playground:"
+  echo -e "     oc apply -f manifests/13-llamastack-distribution.yaml"
+  echo -e "     # The playground requires LlamaStack — it does not talk to the"
+  echo -e "     # LLMInferenceService directly."
+  echo
+  echo -e "  5. Users call the model API with their OpenShift bearer token:"
+  echo -e "     TOKEN=\$(oc whoami -t)"
+  echo -e "     curl -H \"Authorization: Bearer \$TOKEN\" \\"
+  echo -e "       https://llama-3-8b-maas-models.${domain}/v1/chat/completions \\"
+  echo -e "       -d '{\"model\":\"llama-3-1-8b-instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
+  echo
+  echo -e "  5. Inspect resources:"
+  echo -e "     oc get llminferenceservice -n ${MAAS_MODEL_NS}"
+  echo -e "     oc get authpolicy,ratelimitpolicy -n ${MAAS_MODEL_NS}"
+  echo -e "     oc get httproute -n ${MAAS_MODEL_NS}"
+  echo
+  echo -e "  ${BOLD}RHOAI Dashboard:${NC}"
+  echo -e "  $(oc get route rhods-dashboard -n "$RHOAI_APP_NS" \
+    -o jsonpath='https://{.spec.host}' 2>/dev/null || echo 'see: oc get route -n redhat-ods-applications')"
+  echo
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+  parse_args "$@"
+
+  echo
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}${CYAN}║     RHOAI 3.4 — Models-as-a-Service Automation Setup        ║${NC}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+  echo
+
+  check_prerequisites
+
+  if [[ "$SKIP_OPERATORS" == "true" || "$SKIP_CERT_MANAGER" == "true" ]]; then
+    log_warn "--skip-cert-manager: skipping cert-manager installation."
+  else
+    install_cert_manager   # Step 2
+  fi
+
+  if [[ "$SKIP_OPERATORS" == "true" || "$SKIP_RHCL" == "true" ]]; then
+    log_warn "--skip-rhcl: skipping RHCL/Kuadrant installation."
+  else
+    install_rhcl           # Step 3
+  fi
+
+  configure_maas_gateway    # Step 4
+  configure_authorino_tls   # Step 5
+  deploy_postgresql          # Step 6
+  configure_monitoring       # Step 7
+  enable_maas_in_dsc         # Step 8
+  verify_maas_components     # Step 9
+  create_model_namespace     # Step 10
+
+  if [[ "$DEPLOY_EXAMPLE" == "true" ]]; then
+    deploy_example
+  fi
+
+  print_summary
+}
+
+main "$@"

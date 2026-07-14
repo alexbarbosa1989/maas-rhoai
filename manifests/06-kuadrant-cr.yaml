@@ -1,0 +1,8 @@
+# Kuadrant instance — triggers deployment of all RHCL sub-components:
+# Authorino (authn/authz), Limitador (rate limiting), DNS operator, TLS manager.
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: kuadrant-system
+spec: {}

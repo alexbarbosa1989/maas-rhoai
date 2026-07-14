@@ -1,0 +1,55 @@
+# Example LLMInferenceService (serving.kserve.io/v1alpha2)
+# Mirrors the structure created by the RHOAI dashboard (as seen in llama3-maas).
+# Uses the RHEL AI 1.5 llama-3.1-8B FP8 modelcar image from registry.redhat.io.
+#
+# Prerequisites:
+#   - GPU node with FP8 support (NVIDIA H100/H200 recommended)
+#   - Global pull secret must include registry.redhat.io credentials (standard on OCP/ROSA)
+#   - MaaS enabled in the DataScienceCluster (modelsAsService: Managed)
+#   - Gateway maas-default-gateway present in openshift-ingress (created by setup-maas.sh)
+#
+# Before applying, set the hardware profile annotation to your cluster's GPU profile:
+#   oc get hardwareprofile -n redhat-ods-applications
+# Then update opendatahub.io/hardware-profile-name below.
+# NOTE: the annotation is informational only — scheduling is driven by the resource
+# values in spec.template.containers[].resources, not by the profile reference.
+---
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: llama-3-8b
+  namespace: maas-models
+  annotations:
+    opendatahub.io/hardware-profile-name: local-gpu   # replace with your GPU profile name
+    opendatahub.io/hardware-profile-namespace: redhat-ods-applications
+    opendatahub.io/model-type: generative
+  labels:
+    opendatahub.io/dashboard: "true"
+    opendatahub.io/genai-asset: "true"
+spec:
+  model:
+    name: llama-3-8b
+    uri: oci://registry.redhat.io/rhelai1/modelcar-llama-3-1-8b-instruct-fp8-dynamic:1.5
+  replicas: 1
+  router:
+    gateway:
+      refs:
+      - name: maas-default-gateway
+        namespace: openshift-ingress
+    route: {}
+    scheduler: {}
+  template:
+    containers:
+    - name: main
+      env:
+      - name: VLLM_ADDITIONAL_ARGS
+        value: --max-model-len=16000 --enable-auto-tool-choice --tool-call-parser=llama3_json
+      resources:
+        requests:
+          cpu: "1"
+          memory: 4Gi
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: "1"
+          memory: 8Gi
+          nvidia.com/gpu: "1"

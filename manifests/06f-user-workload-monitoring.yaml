@@ -1,0 +1,11 @@
+# Enables OpenShift User Workload Monitoring.
+# Required by MaaS for Showback/FinOps usage tracking dashboards.
+# This ConfigMap must exist before the MaaS API starts.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    enableUserWorkload: true

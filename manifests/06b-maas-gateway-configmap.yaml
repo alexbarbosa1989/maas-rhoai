@@ -1,0 +1,14 @@
+# ConfigMap that instructs OpenShift to auto-generate a service-serving TLS certificate
+# for the maas-default-gateway service (same pattern as data-science-gateway-config).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maas-default-gateway-config
+  namespace: openshift-ingress
+data:
+  service: |
+    metadata:
+      annotations:
+        service.beta.openshift.io/serving-cert-secret-name: "maas-default-gateway-service-tls"
+    spec:
+      type: ClusterIP

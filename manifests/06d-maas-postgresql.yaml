@@ -1,0 +1,88 @@
+# PostgreSQL database required by the MaaS API (maas-db-config Secret must exist in
+# redhat-ods-applications with key DB_CONNECTION_URL).
+# For production, replace this with a managed PostgreSQL instance (RDS, CrunchyData, etc.).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: maas-db
+  labels:
+    app.kubernetes.io/part-of: maas
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: maas-postgresql-credentials
+  namespace: maas-db
+type: Opaque
+stringData:
+  POSTGRESQL_USER: maas
+  POSTGRESQL_PASSWORD: maaspassword
+  POSTGRESQL_DATABASE: maas
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: maas-postgresql
+  namespace: maas-db
+spec:
+  selector:
+    matchLabels:
+      app: maas-postgresql
+  serviceName: maas-postgresql
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: maas-postgresql
+    spec:
+      containers:
+      - name: postgresql
+        image: registry.redhat.io/rhel9/postgresql-15:latest
+        ports:
+        - containerPort: 5432
+          name: postgresql
+        envFrom:
+        - secretRef:
+            name: maas-postgresql-credentials
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/pgsql/data
+        readinessProbe:
+          exec:
+            command: [pg_isready, -U, maas, -d, maas]
+          initialDelaySeconds: 10
+          periodSeconds: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maas-postgresql
+  namespace: maas-db
+spec:
+  selector:
+    app: maas-postgresql
+  ports:
+  - name: postgresql
+    port: 5432
+    targetPort: 5432
+---
+# Secret consumed by the MaaS API — must live in redhat-ods-applications.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: maas-db-config
+  namespace: redhat-ods-applications
+  labels:
+    app.kubernetes.io/part-of: maas
+type: Opaque
+stringData:
+  DB_CONNECTION_URL: "postgresql://maas:maaspassword@maas-postgresql.maas-db.svc.cluster.local:5432/maas"

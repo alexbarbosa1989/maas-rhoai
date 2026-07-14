@@ -1,0 +1,9 @@
+# Namespace where MaaS LLM models are deployed by the platform team.
+# The label opendatahub.io/dashboard: "true" makes it visible in the RHOAI dashboard.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: maas-models
+  labels:
+    opendatahub.io/dashboard: "true"
+    kubernetes.io/metadata.name: maas-models

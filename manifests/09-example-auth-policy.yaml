@@ -1,0 +1,39 @@
+# AuthPolicy — enforces authentication on the model's HTTPRoute.
+# Applied by RHCL/Kuadrant. Validates the caller's OpenShift/K8s Bearer token
+# and performs a SubjectAccessReview to check namespace-level "get services" permission.
+#
+# Replace <MODEL_ROUTE_NAME> with the HTTPRoute name auto-created for the LLMInferenceService.
+# Typically: <llminferenceservice-name>   (check: oc get httproute -n maas-models)
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: llama-3-8b-auth
+  namespace: maas-models
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: llama-3-8b          # must match the HTTPRoute created by the LLMInferenceService
+  rules:
+    authentication:
+      k8s-token:
+        kubernetesTokenReview:
+          audiences: []       # empty = accept any valid SA/user token
+    authorization:
+      namespace-access:
+        kubernetesSubjectAccessReview:
+          user:
+            valueFrom:
+              authJSON: auth.identity.user.username
+          groups:
+            valueFrom:
+              authJSON: auth.identity.user.groups
+          resourceAttributes:
+            namespace:
+              value: maas-models
+            group:
+              value: serving.kserve.io
+            resource:
+              value: llminferenceservices
+            verb:
+              value: get
