@@ -536,8 +536,32 @@ enable_maas_in_dsc() {
   fi
 }
 
+enable_genai_studio() {
+  log_step "Step 9: Enabling GenAI Studio in OdhDashboardConfig"
+
+  if ! oc get OdhDashboardConfig odh-dashboard-config -n "$RHOAI_APP_NS" &>/dev/null; then
+    log_warn "OdhDashboardConfig 'odh-dashboard-config' not found in '${RHOAI_APP_NS}' — skipping."
+    return 0
+  fi
+
+  local current
+  current=$(oc get OdhDashboardConfig odh-dashboard-config -n "$RHOAI_APP_NS" \
+    -o jsonpath='{.spec.dashboardConfig.genAiStudio}' 2>/dev/null)
+
+  if [[ "$current" == "true" ]]; then
+    log_ok "genAiStudio is already enabled — skipping."
+    return 0
+  fi
+
+  log_info "Current genAiStudio: '${current:-unset}' → enabling"
+  oc patch OdhDashboardConfig odh-dashboard-config -n "$RHOAI_APP_NS" \
+    --type=merge \
+    --patch='{"spec":{"dashboardConfig":{"genAiStudio": true}}}'
+  log_ok "genAiStudio enabled in OdhDashboardConfig."
+}
+
 verify_maas_components() {
-  log_step "Step 9: Verifying all MaaS platform components"
+  log_step "Step 10: Verifying all MaaS platform components"
 
   # model-serving-api — LLM catalogue REST API
   wait_for_pods "$RHOAI_APP_NS" "app.kubernetes.io/name=model-serving-api" "$POD_WAIT_TIMEOUT"
@@ -569,7 +593,7 @@ verify_maas_components() {
 }
 
 create_model_namespace() {
-  log_step "Step 10: Creating MaaS model namespace '${MAAS_MODEL_NS}'"
+  log_step "Step 11: Creating MaaS model namespace '${MAAS_MODEL_NS}'"
 
   if resource_exists namespace "$MAAS_MODEL_NS"; then
     log_warn "Namespace '${MAAS_MODEL_NS}' already exists — skipping."
@@ -584,7 +608,7 @@ create_model_namespace() {
 }
 
 deploy_example() {
-  log_step "Step 11 (optional): Deploying example LLMInferenceService and governance policies"
+  log_step "Step 12 (optional): Deploying example LLMInferenceService and governance policies"
   log_warn "Applying example resources from manifests/08–12."
   log_warn "The example uses llama-3.1-8B-Instruct FP8 from registry.redhat.io (RHEL AI 1.5 modelcar)."
   log_warn "Actual pod scheduling requires a GPU node with FP8 support (NVIDIA H100/H200 recommended)."
@@ -654,6 +678,10 @@ print_summary() {
   echo -e "  maas-api                           ${maas_api_ready} pod(s) Running"
   echo -e "  ModelsAsServiceReady               ${maas_ready}"
   echo -e "  modelsAsService                    ${maas_state}"
+  local genai_studio
+  genai_studio=$(oc get OdhDashboardConfig odh-dashboard-config -n "$RHOAI_APP_NS" \
+    -o jsonpath='{.spec.dashboardConfig.genAiStudio}' 2>/dev/null || echo "N/A")
+  echo -e "  GenAI Studio (OdhDashboardConfig)  ${genai_studio}"
   echo -e "  GatewayConfig domain               ${domain}"
   echo -e "  Model namespace                    ${MAAS_MODEL_NS}"
   echo
@@ -743,8 +771,9 @@ main() {
   deploy_postgresql          # Step 6
   configure_monitoring       # Step 7
   enable_maas_in_dsc         # Step 8
-  verify_maas_components     # Step 9
-  create_model_namespace     # Step 10
+  enable_genai_studio        # Step 9
+  verify_maas_components     # Step 10
+  create_model_namespace     # Step 11
 
   if [[ "$DEPLOY_EXAMPLE" == "true" ]]; then
     deploy_example
