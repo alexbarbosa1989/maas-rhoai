@@ -560,8 +560,34 @@ enable_genai_studio() {
   log_ok "genAiStudio enabled in OdhDashboardConfig."
 }
 
+enable_llamastack_operator() {
+  log_step "Step 10: Enabling LlamaStack operator in the DataScienceCluster (required for GenAI Playground)"
+  # The dashboard's GenAI Playground renders only if genAiStudio is enabled AND the
+  # LlamaStack operator component is Managed. genAiStudio alone (Step 9) is not enough —
+  # without this, the playground UI is hidden even though the flag is on.
+
+  local current_state
+  current_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    -o jsonpath='{.spec.components.llamastackoperator.managementState}' 2>/dev/null)
+
+  if [[ "$current_state" == "Managed" ]]; then
+    log_ok "llamastackoperator is already Managed — skipping patch."
+    return 0
+  fi
+
+  log_info "Current llamastackoperator.managementState: '${current_state:-unset}' → Managed"
+  oc patch dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    --type=merge \
+    -p '{"spec":{"components":{"llamastackoperator":{"managementState":"Managed"}}}}'
+
+  wait_for_condition "dsc/${DSC_NAME}" "$RHOAI_OPERATOR_NS" \
+    "LlamaStackOperatorReady" "$OPERATOR_WAIT_TIMEOUT" \
+    || log_warn "LlamaStackOperatorReady condition not confirmed — continuing (LlamaStackDistribution deploy in Step 13 will surface real failures)."
+  log_ok "llamastackoperator enabled in DataScienceCluster."
+}
+
 verify_maas_components() {
-  log_step "Step 10: Verifying all MaaS platform components"
+  log_step "Step 11: Verifying all MaaS platform components"
 
   # model-serving-api — LLM catalogue REST API
   wait_for_pods "$RHOAI_APP_NS" "app.kubernetes.io/name=model-serving-api" "$POD_WAIT_TIMEOUT"
@@ -593,7 +619,7 @@ verify_maas_components() {
 }
 
 create_model_namespace() {
-  log_step "Step 11: Creating MaaS model namespace '${MAAS_MODEL_NS}'"
+  log_step "Step 12: Creating MaaS model namespace '${MAAS_MODEL_NS}'"
 
   if resource_exists namespace "$MAAS_MODEL_NS"; then
     log_warn "Namespace '${MAAS_MODEL_NS}' already exists — skipping."
@@ -608,7 +634,7 @@ create_model_namespace() {
 }
 
 deploy_example() {
-  log_step "Step 12 (optional): Deploying example LLMInferenceService and governance policies"
+  log_step "Step 13 (optional): Deploying example LLMInferenceService and governance policies"
   log_warn "Applying example resources from manifests/08–12."
   log_warn "The example uses llama-3.1-8B-Instruct FP8 from registry.redhat.io (RHEL AI 1.5 modelcar)."
   log_warn "Actual pod scheduling requires a GPU node with FP8 support (NVIDIA H100/H200 recommended)."
@@ -682,6 +708,10 @@ print_summary() {
   genai_studio=$(oc get OdhDashboardConfig odh-dashboard-config -n "$RHOAI_APP_NS" \
     -o jsonpath='{.spec.dashboardConfig.genAiStudio}' 2>/dev/null || echo "N/A")
   echo -e "  GenAI Studio (OdhDashboardConfig)  ${genai_studio}"
+  local llamastack_state
+  llamastack_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    -o jsonpath='{.spec.components.llamastackoperator.managementState}' 2>/dev/null || echo "N/A")
+  echo -e "  llamastackoperator                 ${llamastack_state}"
   echo -e "  GatewayConfig domain               ${domain}"
   echo -e "  Model namespace                    ${MAAS_MODEL_NS}"
   echo
@@ -772,8 +802,9 @@ main() {
   configure_monitoring       # Step 7
   enable_maas_in_dsc         # Step 8
   enable_genai_studio        # Step 9
-  verify_maas_components     # Step 10
-  create_model_namespace     # Step 11
+  enable_llamastack_operator # Step 10
+  verify_maas_components     # Step 11
+  create_model_namespace     # Step 12
 
   if [[ "$DEPLOY_EXAMPLE" == "true" ]]; then
     deploy_example
