@@ -1,0 +1,36 @@
+# AuthPolicy for the MaaS management API (maas-api-route HTTPRoute).
+#
+# The gateway-level maas-default-gateway-authn policy only injects x-maas-user
+# for /v1/files and /v1/batches paths. The maas-api management endpoints
+# (e.g. /maas-api/v1/api-keys/search) need the same identity header but are
+# excluded from that injection, causing maas-api to return:
+#   "Missing or empty username header" (X-MaaS-Username) → HTTP 500
+#
+# This route-level policy:
+#   1. Authenticates the caller via Kubernetes TokenReview (k8s bearer token)
+#   2. Injects x-maas-username = authenticated username into the upstream request
+#   3. Skips the inference SubjectAccessReview (not relevant for the management API)
+#
+# Applied in: setup-maas.sh configure_maas_gateway() after the Route is created.
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: maas-api-route-auth
+  namespace: redhat-ods-applications
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: maas-api-route
+  rules:
+    authentication:
+      kubernetes-user:
+        kubernetesTokenReview:
+          audiences:
+          - https://kubernetes.default.svc
+    response:
+      success:
+        headers:
+          x-maas-username:
+            plain:
+              expression: auth.identity.user.username
