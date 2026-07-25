@@ -66,7 +66,7 @@ Data Scientist / App
 | Requirement | Notes |
 |---|---|
 | OpenShift 4.19.9+ (ROSA supported) | Any flavour; cluster-admin access required |
-| RHOAI 3.4.1 installed | Operator + DSC + DSCI must exist |
+| RHOAI 3.4.0+ installed | Operator + DSC + DSCI must exist |
 | Red Hat Service Mesh 3.x | Already installed if using RHOAI 3.4 with KServe |
 | `oc` CLI | Logged in as cluster-admin |
 | Internet access | To pull operator images from `registry.redhat.io` |
