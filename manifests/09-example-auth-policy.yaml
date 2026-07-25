@@ -23,11 +23,9 @@ spec:
       namespace-access:
         kubernetesSubjectAccessReview:
           user:
-            valueFrom:
-              authJSON: auth.identity.user.username
-          groups:
-            valueFrom:
-              authJSON: auth.identity.user.groups
+            selector: auth.identity.user.username
+          authorizationGroups:
+            selector: auth.identity.user.groups
           resourceAttributes:
             namespace:
               value: maas-models

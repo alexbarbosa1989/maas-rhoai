@@ -87,16 +87,26 @@ oc login https://api.<cluster>.<domain>:443 \
 # 3. Run the automation (installs everything end-to-end)
 ./setup-maas.sh
 
-# 4. Optionally also deploy the example LLMInferenceService
-./setup-maas.sh --deploy-example
+# 4. Optionally deploy the example LLMInferenceService, governance policies,
+#    RBAC, and LlamaStack playground
+./deploy-example-workload.sh
 ```
 
 ### Flags
 
+`setup-maas.sh`:
+
 | Flag | Description |
 |---|---|
 | `--skip-operators` | Skip cert-manager and RHCL installation (already installed) |
-| `--deploy-example` | Apply example LLMInferenceService and governance policies |
+| `--help` | Show usage |
+
+`deploy-example-workload.sh` (run after `setup-maas.sh`):
+
+| Flag | Description |
+|---|---|
+| `--skip-llamastack` | Skip deploying the LlamaStackDistribution (GenAI Playground) |
+| `--hardware-profile-name NAME` | GPU HardwareProfile to annotate the LLMInferenceService with (overrides auto-detection) |
 | `--help` | Show usage |
 
 ### Environment variables
@@ -113,6 +123,10 @@ export DSC_NAME=default-dsc                    # DataScienceCluster name
 export OPERATOR_WAIT_TIMEOUT=600               # Seconds to wait for operators
 export POD_WAIT_TIMEOUT=300                    # Seconds to wait for pods
 export KUADRANT_WAIT_TIMEOUT=300               # Seconds to wait for Kuadrant Ready
+
+# deploy-example-workload.sh only:
+export MODEL_WAIT_TIMEOUT=600                  # Seconds to wait for the example model/LlamaStack pod
+export HARDWARE_PROFILE_NAME=                  # GPU HardwareProfile to use (same as --hardware-profile-name)
 ```
 
 ---
@@ -207,7 +221,22 @@ spec:
 
 This activates the MaaS platform layer. The RHOAI operator then deploys `maas-controller` and `maas-api`, and creates the `Tenant/default-tenant` CR in `models-as-a-service`.
 
-### Step 9 — Verify MaaS components
+### Step 9 — Enable GenAI Studio
+Patches `OdhDashboardConfig/odh-dashboard-config` to set `spec.dashboardConfig.genAiStudio: true`, which surfaces the GenAI Studio section (including the GenAI Playground) in the RHOAI dashboard.
+
+### Step 10 — Enable LlamaStack operator
+Patches the `DataScienceCluster` to set:
+
+```yaml
+spec:
+  components:
+    llamastackoperator:
+      managementState: Managed
+```
+
+The GenAI Playground needs both this **and** Step 9's `genAiStudio` flag — `genAiStudio` alone only unlocks the UI section; without the LlamaStack operator Managed, the playground has no distribution to connect to. Waits for DSC condition `LlamaStackOperatorReady: True`.
+
+### Step 11 — Verify MaaS components
 Waits for and checks that the following are all Running:
 
 - `model-serving-api` (REST catalogue, port 8443)
@@ -217,17 +246,18 @@ Waits for and checks that the following are all Running:
 - `GatewayConfig/default-gateway` (condition: `GatewayConfigReady`)
 - DSC condition: `ModelsAsServiceReady: True`
 
-### Step 10 — Create model namespace
+### Step 12 — Create model namespace
 Creates the `maas-models` namespace with the `opendatahub.io/dashboard: "true"` label so it appears in the RHOAI dashboard.
 
-### Step 11 (optional) — Deploy example resources
-Applied only with `--deploy-example`. Deploys:
+### Step 13 (optional) — Deploy example resources
+Not part of `setup-maas.sh` — run `./deploy-example-workload.sh` separately once the platform is up. Deploys:
 
 - `llama-3-8b` LLMInferenceService (llama-3.1-8B-Instruct FP8, OCI modelcar from `registry.redhat.io/rhelai1`)
 - `AuthPolicy` — K8s token review + SubjectAccessReview
 - `RateLimitPolicy` — 10 req/10 s per user, 100 req/10 s global
 - `TokenRateLimitPolicy` — 100 000 tokens/day per user
 - `RoleBinding` — grants `view` ClusterRole to group `maas-users`
+- `LlamaStackDistribution` for the GenAI Playground, unless `--skip-llamastack` is passed
 
 > **GPU requirement:** The example model requires a GPU node with FP8 support (NVIDIA H100/H200 recommended). Resources are sized to the cluster HardwareProfile: 2–4 CPU, 4–8 GiB memory, 1 GPU. On clusters without a matching GPU node the pod will remain Pending — the HTTPRoute and governance policies are still created and verifiable.
 >
@@ -239,8 +269,15 @@ Applied only with `--deploy-example`. Deploys:
 
 ```
 maas-rhoai/
-├── setup-maas.sh                              # Main automation script
+├── setup-maas.sh                              # Platform bootstrap (operators, gateway, DSC, dashboard flags)
+├── deploy-example-workload.sh                 # Example model, governance policies, RBAC, LlamaStack playground
+├── teardown-maas.sh                           # Removes everything the above create
+├── fix-lsd-genai-playground.sh                # Repairs a dashboard-created LlamaStackDistribution's vLLM TLS scheme (see LSD-WORKAROUND.md)
 ├── README.md                                  # This file
+├── TEARDOWN-README.md                         # Detailed teardown reference (flags, removal tables, manual cleanup recipes)
+├── LSD-WORKAROUND.md                          # GenAI Playground vLLM TLS bug: root cause + fix
+├── lib/
+│   └── common.sh                              # Shared logging / oc-polling helpers, sourced by all 3 scripts
 └── manifests/
     ├── 01-cert-manager-namespace.yaml         # cert-manager-operator namespace
     ├── 02-cert-manager-operatorgroup.yaml     # OperatorGroup for cert-manager
@@ -412,6 +449,35 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 
 ---
 
+## Teardown
+
+`teardown-maas.sh` removes everything `setup-maas.sh` (and `deploy-example-workload.sh`) created.
+
+```bash
+./teardown-maas.sh            # interactive, prompts for confirmation
+./teardown-maas.sh --yes      # skip the confirmation prompt
+./teardown-maas.sh --full     # also uninstall cert-manager and RHCL/Kuadrant operators
+```
+
+### What gets removed
+
+- All `LlamaStackDistribution`, `LLMInferenceService`, `AuthPolicy`, `RateLimitPolicy`, `TokenRateLimitPolicy`, and `RoleBinding` resources in `maas-models`, then the `maas-models` namespace itself
+- DSC `kserve.modelsAsService` reverted to `Removed`
+- DSC `llamastackoperator` reverted to `Removed` — **conditionally**: since `llamastackoperator` is a cluster-scoped DSC component that may back LlamaStack workloads outside MaaS, the script first deletes the MaaS `LlamaStackDistribution` and then checks `oc get llamastackdistribution -A` cluster-wide. It only reverts the operator to `Removed` if none remain; otherwise it logs a warning and leaves it `Managed`.
+- Gateway `maas-default-gateway` (and its ConfigMap) in `openshift-ingress`
+- Authorino TLS patch reverted; `Certificate` and `ClusterIssuer` deleted
+- PostgreSQL (`maas-db` namespace + `maas-db-config` Secret)
+
+With `--full`, the cert-manager and RHCL/Kuadrant operators (Subscriptions, CSVs, OperatorGroups, namespaces) are uninstalled as well.
+
+### Not removed in either mode
+
+- RHOAI operator and the DataScienceCluster itself (pre-existing)
+- `cluster-monitoring-config` (may be used by other workloads)
+- `models-as-a-service` namespace (RHOAI cleans it up after the DSC reconciles — can get stuck `Terminating` if `maas-controller` is unhealthy when the `Tenant` CR's finalizer needs to run; see [TEARDOWN-README.md](TEARDOWN-README.md#force-delete-a-stuck-namespace) for the force-delete procedure)
+
+---
+
 ## Troubleshooting
 
 ### Tenant/default-tenant stuck in Pending phase
@@ -480,6 +546,28 @@ oc get authpolicy -n maas-models
 oc describe authpolicy <name> -n maas-models
 oc logs -n kuadrant-system -l app=authorino --tail=50
 ```
+
+### AuthPolicy rejected: `kubernetesSubjectAccessReview.groups` must be of type array
+The RHCL `AuthPolicy` v1 CRD deprecated the object-style `groups.valueFrom.authJSON` selector in
+favor of a top-level `authorizationGroups` field (also `groups` itself is now typed as a static
+string array, not a selector object). `manifests/09-example-auth-policy.yaml` uses the current
+`user.selector` / `authorizationGroups.selector` syntax — if you copy this pattern elsewhere, use:
+```yaml
+kubernetesSubjectAccessReview:
+  user:
+    selector: auth.identity.user.username
+  authorizationGroups:
+    selector: auth.identity.user.groups
+```
+not the older `valueFrom: { authJSON: ... }` form.
+
+### GenAI Playground chat fails with "Server disconnected without sending a response"
+`LLMInferenceService` workload pods always serve TLS on port 8000 (via `SSLCertRefresher`), but a
+`LlamaStackDistribution` created through the RHOAI **dashboard** generates its vLLM provider
+`base_url` with `http://`, causing every inference call to fail. `manifests/13-llamastack-distribution.yaml`
+already uses `https://` (fixed 2026-07-25), so this shouldn't happen via `./deploy-example-workload.sh`.
+If you hit it on a dashboard-created LlamaStack instance, see [LSD-WORKAROUND.md](LSD-WORKAROUND.md)
+or run `./fix-lsd-genai-playground.sh [NAMESPACE] [LSD_NAME]`.
 
 ### Check all MaaS component status at once
 ```bash

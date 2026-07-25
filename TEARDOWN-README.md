@@ -55,6 +55,7 @@ export DSC_NAME=default-dsc
 | All `RoleBinding` resources | `maas-models` namespace |
 | Namespace `maas-models` | cluster-scoped |
 | DSC `modelsAsService` reverted to `Removed` | `redhat-ods-operator` namespace |
+| DSC `llamastackoperator` reverted to `Removed` — **only if** no `LlamaStackDistribution` resources remain anywhere on the cluster (it's cluster-scoped and may back non-MaaS workloads); otherwise left `Managed` with a warning | `redhat-ods-operator` namespace |
 | Gateway `maas-default-gateway` | `openshift-ingress` namespace |
 | ConfigMap `maas-default-gateway-config` | `openshift-ingress` namespace |
 | Authorino TLS patch reverted | `kuadrant-system` namespace |
@@ -82,7 +83,7 @@ export DSC_NAME=default-dsc
 |---|---|
 | RHOAI operator and `DataScienceCluster` | Pre-existing; not created by `setup-maas.sh` |
 | `cluster-monitoring-config` (openshift-monitoring) | May be shared with other workloads; delete manually if needed |
-| Namespace `models-as-a-service` | Owned by the RHOAI operator; cleaned up automatically after DSC reconciles |
+| Namespace `models-as-a-service` | Owned by the RHOAI operator; cleaned up automatically after DSC reconciles. Can get stuck `Terminating` if `maas-controller` is unhealthy when the `Tenant` CR's finalizer needs to run — see [Force-delete a stuck namespace](#force-delete-a-stuck-namespace) below |
 | OLM CRDs (cert-manager, Kuadrant) | OLM leaves CRDs behind after operator removal; `setup-maas.sh` re-run handles this automatically by detecting CSV state rather than CRD presence |
 
 ---
@@ -91,8 +92,10 @@ export DSC_NAME=default-dsc
 
 Steps run in reverse dependency order to avoid controller races:
 
-1. **Delete model workloads** — `LLMInferenceService` and policies are deleted first so the `llmisvc-controller` can clean up dependent resources (HTTPRoutes, certs) before the namespace is forcibly removed. The script waits 15 s between workload deletion and namespace deletion.
+1. **Delete model workloads** — `LlamaStackDistribution`, `LLMInferenceService`, and policies are deleted first so their controllers can clean up dependent resources (HTTPRoutes, certs) before the namespace is forcibly removed. The script waits 15 s between workload deletion and namespace deletion. Deleting the MaaS `LlamaStackDistribution` here first is what makes step 2b's cluster-wide check accurate.
 2. **Revert DSC** — after workloads are gone so the `maas-controller` does not race to recreate them.
+   - **2a.** `modelsAsService` → `Removed` unconditionally.
+   - **2b.** `llamastackoperator` → `Removed` only if `oc get llamastackdistribution -A` now returns none; otherwise left `Managed` with a warning, since this DSC component is cluster-scoped and may be used outside MaaS.
 3. **Delete MaaS gateway** — no longer needed once the DSC is reverted.
 4. **Revert Authorino TLS** — patches the Authorino CR back to `tls.enabled: false`, then deletes the certificate and ClusterIssuer.
 5. **Delete PostgreSQL** — `maas-db` namespace and the `maas-db-config` Secret in `redhat-ods-applications`.
@@ -123,12 +126,31 @@ oc delete configmap cluster-monitoring-config -n openshift-monitoring
 
 ### Force-delete a stuck namespace
 
-If a namespace gets stuck in `Terminating` due to finalizers:
+If a namespace gets stuck in `Terminating`, it's usually because an object inside it
+(commonly a CR like `Tenant` in `models-as-a-service`) has its own finalizer that never
+got cleared — check what's still there before force-clearing:
 
 ```bash
-# Identify stuck finalizers
-oc get namespace <name> -o jsonpath='{.spec.finalizers}'
+# Identify what's still blocking deletion
+oc api-resources --verbs=list --namespaced -o name \
+  | xargs -n1 -I{} sh -c 'oc get {} -n <name> 2>/dev/null | grep -q . && echo {}'
+```
 
-# Remove finalizers
-oc patch namespace <name> -p '{"spec":{"finalizers":[]}}' --type=merge
+A plain `oc patch namespace <name> --type=merge -p '{"spec":{"finalizers":[]}}'` against the
+namespace's main endpoint does **not** reliably clear this — namespace finalizer removal
+requires the `/finalize` subresource:
+
+```bash
+oc get namespace <name> -o json \
+  | jq '.spec.finalizers = []' \
+  | oc replace --raw "/api/v1/namespaces/<name>/finalize" -f -
+```
+
+**Caution:** this bypasses whatever cleanup the owning controller (e.g. `maas-controller` for
+the `Tenant` CR) was supposed to do — it may leave orphaned cluster-scoped resources behind
+(`ClusterRole`/`ClusterRoleBinding` labeled `maas.opendatahub.io/tenant-name=default-tenant`).
+Check for and clean those up manually after forcing the deletion:
+
+```bash
+oc get clusterrole,clusterrolebinding -l maas.opendatahub.io/tenant-name=default-tenant
 ```

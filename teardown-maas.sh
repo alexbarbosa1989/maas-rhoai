@@ -23,15 +23,10 @@ DSC_NAME="${DSC_NAME:-default-dsc}"
 FULL=false
 YES=false
 
-# ─── Colours ──────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-log_step()  { echo -e "\n${BOLD}${BLUE}▶ $*${NC}"; }
-log_ok()    { echo -e "${GREEN}✔${NC} $*"; }
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR}/lib/common.sh"
 
 # ─── Argument parsing ─────────────────────────────────────────────────────────
 parse_args() {
@@ -58,6 +53,9 @@ Without --full the following are removed:
     TokenRateLimitPolicy, and RoleBinding in maas-models
   - Namespace maas-models
   - DSC reverted (modelsAsService: Removed)
+  - DSC llamastackoperator reverted (Removed) — only if no LlamaStackDistribution
+    resources remain anywhere on the cluster (it's cluster-scoped and may be
+    used outside MaaS)
   - Gateway maas-default-gateway (openshift-ingress)
   - Authorino TLS patch reverted; Certificate + ClusterIssuer deleted
   - PostgreSQL (maas-db namespace + maas-db-config Secret)
@@ -121,6 +119,27 @@ revert_dsc() {
     -p '{"spec":{"components":{"kserve":{"modelsAsService":{"managementState":"Removed"}}}}}' \
     || log_warn "Could not patch DSC — check manually."
   log_ok "DataScienceCluster modelsAsService set to Removed."
+}
+
+revert_llamastack_operator() {
+  log_step "Reverting DataScienceCluster llamastackoperator setting"
+  if ! oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" &>/dev/null; then
+    log_warn "DSC '${DSC_NAME}' not found — skipping."
+    return 0
+  fi
+  # llamastackoperator is cluster-scoped: only disable it if no LlamaStackDistribution
+  # workloads remain anywhere on the cluster (there may be ones outside MaaS).
+  local remaining
+  remaining=$(oc get llamastackdistribution -A --no-headers 2>/dev/null | wc -l)
+  if (( remaining > 0 )); then
+    log_warn "${remaining} LlamaStackDistribution resource(s) still exist cluster-wide — leaving llamastackoperator Managed."
+    return 0
+  fi
+  oc patch dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    --type=merge \
+    -p '{"spec":{"components":{"llamastackoperator":{"managementState":"Removed"}}}}' \
+    || log_warn "Could not patch DSC — check manually."
+  log_ok "DataScienceCluster llamastackoperator set to Removed."
 }
 
 delete_maas_gateway() {
@@ -188,6 +207,7 @@ main() {
 
   delete_model_workloads   # delete workloads before reverting DSC so controller can clean up
   revert_dsc
+  revert_llamastack_operator
   delete_maas_gateway
   revert_authorino_tls
   delete_postgresql

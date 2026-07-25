@@ -4,12 +4,15 @@
 # Reference: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html-single/govern_llm_access_with_models-as-a-service/index
 #
 # Usage:
-#   ./setup-maas.sh [--skip-operators] [--deploy-example] [--help]
+#   ./setup-maas.sh [--skip-operators] [--help]
 #
 # Options:
 #   --skip-operators   Skip cert-manager and RHCL operator installation (use if already installed)
-#   --deploy-example   Also apply the example LLMInferenceService and governance policies
 #   --help             Show this message
+#
+# This script installs and configures the MaaS platform layer only. To deploy the
+# example model, governance policies, and LlamaStack playground, run
+# ./deploy-example-workload.sh afterwards.
 
 set -uo pipefail
 
@@ -26,22 +29,15 @@ OPERATOR_WAIT_TIMEOUT="${OPERATOR_WAIT_TIMEOUT:-600}"   # seconds
 POD_WAIT_TIMEOUT="${POD_WAIT_TIMEOUT:-300}"             # seconds
 KUADRANT_WAIT_TIMEOUT="${KUADRANT_WAIT_TIMEOUT:-300}"   # seconds
 
-MANIFESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/manifests"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MANIFESTS_DIR="${SCRIPT_DIR}/manifests"
 
 SKIP_OPERATORS=false
 SKIP_CERT_MANAGER=false
 SKIP_RHCL=false
-DEPLOY_EXAMPLE=false
 
-# ─── Colours ──────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-
-log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-log_step()  { echo -e "\n${BOLD}${BLUE}▶ $*${NC}"; }
-log_ok()    { echo -e "${GREEN}✔${NC} $*"; }
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR}/lib/common.sh"
 
 # ─── Argument parsing ─────────────────────────────────────────────────────────
 parse_args() {
@@ -50,7 +46,6 @@ parse_args() {
       --skip-operators)   SKIP_OPERATORS=true ;;
       --skip-cert-manager) SKIP_CERT_MANAGER=true ;;
       --skip-rhcl)        SKIP_RHCL=true ;;
-      --deploy-example)   DEPLOY_EXAMPLE=true ;;
       --help)
         cat <<'USAGE'
 setup-maas.sh — Automates MaaS configuration on Red Hat OpenShift AI 3.4.
@@ -63,12 +58,16 @@ Options:
   --skip-operators    Skip both cert-manager and RHCL installation
   --skip-cert-manager Skip cert-manager installation only
   --skip-rhcl         Skip RHCL/Kuadrant installation only
-  --deploy-example    Also apply example LLMInferenceService and governance policies
   --help              Show this message
 
 Note: Each operator step auto-detects whether it is already installed by checking
 for its CRDs (certificates.cert-manager.io, kuadrants.kuadrant.io). The --skip-*
 flags force-bypass even that detection.
+
+This script installs and configures the MaaS platform layer only (operators, gateway,
+Authorino TLS, PostgreSQL, DSC/dashboard flags). It does not deploy any model. Run
+./deploy-example-workload.sh afterwards to deploy the example LLMInferenceService,
+governance policies, and LlamaStack playground.
 
 Environment variables (all optional, shown with defaults):
   RHOAI_OPERATOR_NS=redhat-ods-operator   RHOAI_APP_NS=redhat-ods-applications
@@ -82,147 +81,9 @@ USAGE
   done
 }
 
-# ─── Utility functions ────────────────────────────────────────────────────────
-
-# approve_installplan_for_sub NAMESPACE SUBSCRIPTION_NAME
-# Finds the InstallPlan referenced by a subscription and approves it if Manual.
-# Handles clusters where OLM overrides Automatic to Manual (e.g. via admission webhooks).
-approve_installplan_for_sub() {
-  local ns="$1" sub="$2"
-  local deadline=$(( $(date +%s) + 120 ))
-  log_info "Checking InstallPlan approval for subscription '${sub}' in '${ns}'…"
-  while true; do
-    local plan_name
-    plan_name=$(oc get subscription "$sub" -n "$ns" \
-      -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null)
-    if [[ -n "$plan_name" ]]; then
-      local approved
-      approved=$(oc get installplan "$plan_name" -n "$ns" \
-        -o jsonpath='{.spec.approved}' 2>/dev/null)
-      if [[ "$approved" != "true" ]]; then
-        local csvs
-        csvs=$(oc get installplan "$plan_name" -n "$ns" \
-          -o jsonpath='{.spec.clusterServiceVersionNames}' 2>/dev/null)
-        log_info "Approving InstallPlan '${plan_name}' (CSVs: ${csvs})…"
-        oc patch installplan "$plan_name" -n "$ns" \
-          --type=merge -p '{"spec":{"approved":true}}'
-        log_ok "InstallPlan '${plan_name}' approved."
-      else
-        log_ok "InstallPlan '${plan_name}' already approved."
-      fi
-      return 0
-    fi
-    if (( $(date +%s) > deadline )); then
-      log_warn "No InstallPlan found for subscription '${sub}' in '${ns}' after 120s — continuing."
-      return 0
-    fi
-    sleep 5
-  done
-}
-
-# wait_for_csv NAMESPACE PACKAGE TIMEOUT_SECS
-# Polls until an operator's ClusterServiceVersion reaches Succeeded phase.
-wait_for_csv() {
-  local ns="$1" pkg="$2" timeout="$3"
-  local deadline=$(( $(date +%s) + timeout ))
-  log_info "Waiting for CSV '${pkg}' in namespace '${ns}' (timeout: ${timeout}s)…"
-  while true; do
-    local phase
-    phase=$(oc get csv -n "$ns" 2>/dev/null \
-      | awk -v p="$pkg" '$1 ~ p {print $NF}' | head -1)
-    if [[ "$phase" == "Succeeded" ]]; then
-      log_ok "CSV '${pkg}' is Succeeded."
-      return 0
-    fi
-    if (( $(date +%s) > deadline )); then
-      log_error "Timed out waiting for CSV '${pkg}' (last phase: '${phase:-not found}')."
-      oc get csv -n "$ns" 2>/dev/null
-      return 1
-    fi
-    sleep 10
-  done
-}
-
-# wait_for_condition RESOURCE NAMESPACE CONDITION TIMEOUT_SECS
-# Waits until a resource's .status.conditions contains condition=True.
-wait_for_condition() {
-  local resource="$1" ns="$2" condition="$3" timeout="$4"
-  local deadline=$(( $(date +%s) + timeout ))
-  log_info "Waiting for '${resource}' in '${ns}' to reach condition '${condition}'…"
-  while true; do
-    local status
-    status=$(oc get "$resource" -n "$ns" \
-      -o jsonpath="{.status.conditions[?(@.type==\"${condition}\")].status}" 2>/dev/null)
-    if [[ "$status" == "True" ]]; then
-      log_ok "'${resource}' condition '${condition}' is True."
-      return 0
-    fi
-    if (( $(date +%s) > deadline )); then
-      log_error "Timed out waiting for '${resource}' condition '${condition}' (status='${status}')."
-      oc describe "$resource" -n "$ns" 2>/dev/null | tail -20
-      return 1
-    fi
-    sleep 10
-  done
-}
-
-# wait_for_pods NAMESPACE LABEL TIMEOUT_SECS
-# Waits until at least one pod matching the label selector is Running.
-wait_for_pods() {
-  local ns="$1" selector="$2" timeout="$3"
-  local deadline=$(( $(date +%s) + timeout ))
-  log_info "Waiting for pods (selector='${selector}') in '${ns}'…"
-  while true; do
-    local running
-    running=$(oc get pods -n "$ns" -l "$selector" \
-      --field-selector=status.phase=Running 2>/dev/null | grep -c Running || true)
-    if (( running > 0 )); then
-      log_ok "${running} pod(s) Running in '${ns}' (selector='${selector}')."
-      return 0
-    fi
-    # Fail fast on unrecoverable image pull errors rather than waiting the full timeout.
-    local pull_err
-    pull_err=$(oc get pods -n "$ns" -l "$selector" 2>/dev/null \
-      | grep -c "ImagePullBackOff\|ErrImagePull" || true)
-    if (( pull_err > 0 )); then
-      log_error "Image pull failed for pods (selector='${selector}') in '${ns}':"
-      oc get pods -n "$ns" -l "$selector" 2>/dev/null
-      oc describe pod -n "$ns" -l "$selector" 2>/dev/null \
-        | grep -A5 "Events:" | tail -10
-      return 1
-    fi
-    if (( $(date +%s) > deadline )); then
-      log_error "Timed out waiting for pods (selector='${selector}') in '${ns}'."
-      oc get pods -n "$ns" -l "$selector" 2>/dev/null
-      return 1
-    fi
-    sleep 10
-  done
-}
-
-# apply_manifest FILE
-# Applies a manifest. Silences "already exists" warnings (idempotent).
-apply_manifest() {
-  local file="$1"
-  local out
-  if out=$(oc apply -f "$file" 2>&1); then
-    echo "$out"
-    return 0
-  fi
-  if echo "$out" | grep -q "already exists"; then
-    log_warn "Already exists (skipping): ${file##*/}"
-    return 0
-  fi
-  log_error "Failed to apply '${file##*/}': ${out}"
-  return 1
-}
-
-# resource_exists KIND NAME NAMESPACE
-resource_exists() {
-  oc get "$1" "$2" ${3:+-n "$3"} &>/dev/null
-}
-
 # ─── Steps ────────────────────────────────────────────────────────────────────
+# (approve_installplan_for_sub, wait_for_csv, wait_for_condition, wait_for_pods,
+#  apply_manifest, resource_exists are defined in lib/common.sh)
 
 check_prerequisites() {
   log_step "Step 1: Checking prerequisites"
@@ -633,38 +494,6 @@ create_model_namespace() {
   log_info "See: ${MANIFESTS_DIR}/08-example-llminferenceservice.yaml"
 }
 
-deploy_example() {
-  log_step "Step 13 (optional): Deploying example LLMInferenceService and governance policies"
-  log_warn "Applying example resources from manifests/08–12."
-  log_warn "The example uses llama-3.1-8B-Instruct FP8 from registry.redhat.io (RHEL AI 1.5 modelcar)."
-  log_warn "Actual pod scheduling requires a GPU node with FP8 support (NVIDIA H100/H200 recommended)."
-
-  apply_manifest "${MANIFESTS_DIR}/08-example-llminferenceservice.yaml"
-  apply_manifest "${MANIFESTS_DIR}/09-example-auth-policy.yaml"
-  apply_manifest "${MANIFESTS_DIR}/10-example-ratelimit-policy.yaml"
-  apply_manifest "${MANIFESTS_DIR}/11-example-token-ratelimit-policy.yaml"
-  apply_manifest "${MANIFESTS_DIR}/12-example-rbac-viewer.yaml"
-
-  log_info "Waiting for LLMInferenceService to initialise (may take several minutes)…"
-  local deadline=$(( $(date +%s) + 600 ))
-  while true; do
-    local ready
-    ready=$(oc get llminferenceservice llama-3-8b -n "$MAAS_MODEL_NS" \
-      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
-    if [[ "$ready" == "True" ]]; then
-      log_ok "LLMInferenceService 'llama-3-8b' is Ready."
-      break
-    fi
-    if (( $(date +%s) > deadline )); then
-      log_warn "LLMInferenceService not Ready within 10 minutes — check pod status:"
-      oc get pods -n "$MAAS_MODEL_NS" 2>/dev/null
-      log_warn "Continuing with summary…"
-      break
-    fi
-    sleep 15
-  done
-}
-
 print_summary() {
   log_step "Setup complete — Summary"
 
@@ -716,54 +545,26 @@ print_summary() {
   echo -e "  Model namespace                    ${MAAS_MODEL_NS}"
   echo
   local gpu_profile
-  gpu_profile=$(oc get hardwareprofile -n "$RHOAI_APP_NS" -o json 2>/dev/null \
-    | python3 -c "
-import json,sys
-profiles = json.load(sys.stdin).get('items', [])
-for p in profiles:
-    ids = p.get('spec', {}).get('identifiers', [])
-    if any(i.get('identifier') == 'nvidia.com/gpu' for i in ids):
-        print(p['metadata']['name'])
-        break
-" 2>/dev/null || echo "")
+  gpu_profile=$(detect_gpu_hardware_profile "$RHOAI_APP_NS")
 
   echo -e "  ${BOLD}Next steps:${NC}"
   if [[ -n "$gpu_profile" ]]; then
-    echo -e "  GPU HardwareProfile detected: ${BOLD}${gpu_profile}${NC}"
-    echo -e "  Update manifests/08-example-llminferenceservice.yaml if needed:"
-    echo -e "    opendatahub.io/hardware-profile-name: ${gpu_profile}"
+    echo -e "  GPU HardwareProfile detected: ${BOLD}${gpu_profile}${NC} (deploy-example-workload.sh will use it automatically)"
     echo
   else
     echo -e "  ${YELLOW}[WARN]${NC}  No GPU HardwareProfile found in '${RHOAI_APP_NS}'."
-    echo -e "  Create one in the RHOAI dashboard before deploying a model."
+    echo -e "  Create one in the RHOAI dashboard, or pass one explicitly to deploy-example-workload.sh"
+    echo -e "  with --hardware-profile-name <name> when you deploy the example model."
     echo
   fi
-  echo -e "  1. Deploy an LLMInferenceService in namespace '${MAAS_MODEL_NS}':"
-  echo -e "     oc apply -f manifests/08-example-llminferenceservice.yaml"
+  echo -e "  1. Deploy the example model, governance policies, and LlamaStack playground:"
+  echo -e "     ./deploy-example-workload.sh"
   echo
-  echo -e "  2. Apply governance policies (after HTTPRoute is created by the controller):"
-  echo -e "     oc apply -f manifests/09-example-auth-policy.yaml"
-  echo -e "     oc apply -f manifests/10-example-ratelimit-policy.yaml"
-  echo -e "     oc apply -f manifests/11-example-token-ratelimit-policy.yaml"
-  echo
-  echo -e "  3. Grant user/group access to the model namespace:"
-  echo -e "     oc apply -f manifests/12-example-rbac-viewer.yaml"
-  echo
-  echo -e "  4. (Optional) Deploy LlamaStack for the RHOAI GenAI Playground:"
-  echo -e "     oc apply -f manifests/13-llamastack-distribution.yaml"
-  echo -e "     # The playground requires LlamaStack — it does not talk to the"
-  echo -e "     # LLMInferenceService directly."
-  echo
-  echo -e "  5. Users call the model API with their OpenShift bearer token:"
+  echo -e "  2. Users call the model API with their OpenShift bearer token:"
   echo -e "     TOKEN=\$(oc whoami -t)"
   echo -e "     curl -H \"Authorization: Bearer \$TOKEN\" \\"
   echo -e "       https://llama-3-8b-maas-models.${domain}/v1/chat/completions \\"
   echo -e "       -d '{\"model\":\"llama-3-1-8b-instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
-  echo
-  echo -e "  5. Inspect resources:"
-  echo -e "     oc get llminferenceservice -n ${MAAS_MODEL_NS}"
-  echo -e "     oc get authpolicy,ratelimitpolicy -n ${MAAS_MODEL_NS}"
-  echo -e "     oc get httproute -n ${MAAS_MODEL_NS}"
   echo
   echo -e "  ${BOLD}RHOAI Dashboard:${NC}"
   echo -e "  $(oc get route rhods-dashboard -n "$RHOAI_APP_NS" \
@@ -805,10 +606,6 @@ main() {
   enable_llamastack_operator # Step 10
   verify_maas_components     # Step 11
   create_model_namespace     # Step 12
-
-  if [[ "$DEPLOY_EXAMPLE" == "true" ]]; then
-    deploy_example
-  fi
 
   print_summary
 }
