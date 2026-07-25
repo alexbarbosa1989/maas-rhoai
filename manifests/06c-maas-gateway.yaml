@@ -10,6 +10,12 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: maas-controller
     app.kubernetes.io/part-of: maas
+  annotations:
+    # Prevents the ODH Model Controller from overriding MaaS-managed authorization policies.
+    opendatahub.io/managed: "false"
+    # Enables TLS communication between the Gateway and Authorino (MaaS controller creates
+    # an EnvoyFilter to configure the Envoy proxy accordingly).
+    security.opendatahub.io/authorino-tls-bootstrap: "true"
 spec:
   gatewayClassName: data-science-gateway-class
   infrastructure:

@@ -48,15 +48,17 @@ Options:
   --help  Show this message
 
 Without --full the following are removed:
-  - All LlamaStackDistribution in maas-models
-  - All LLMInferenceService, AuthPolicy, RateLimitPolicy,
-    TokenRateLimitPolicy, and RoleBinding in maas-models
+  - All LlamaStackDistribution, LLMInferenceService, and MaaSModelRef in maas-models
+    (plus any leftover AuthPolicy/RateLimitPolicy/TokenRateLimitPolicy/RoleBinding
+    from older versions of this script)
+  - MaaSSubscription 'llama-3-8b-free' and MaaSAuthPolicy 'llama-3-8b-access'
+    in models-as-a-service (the namespace itself is left in place — it's owned by RHOAI)
   - Namespace maas-models
   - DSC reverted (modelsAsService: Removed)
   - DSC llamastackoperator reverted (Removed) — only if no LlamaStackDistribution
     resources remain anywhere on the cluster (it's cluster-scoped and may be
     used outside MaaS)
-  - Gateway maas-default-gateway (openshift-ingress)
+  - Gateway maas-default-gateway and its external Route (openshift-ingress)
   - Authorino TLS patch reverted; Certificate + ClusterIssuer deleted
   - PostgreSQL (maas-db namespace + maas-db-config Secret)
 
@@ -98,10 +100,20 @@ delete_model_workloads() {
   # (HTTPRoutes, certs) before the namespace is forcibly removed.
   oc delete llamastackdistribution --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
   oc delete llminferenceservice --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
+  oc delete maasmodelref --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
+  # Leftover cleanup for clusters that ran an older version of deploy-example-workload.sh
+  # (pre-MaaSModelRef, when governance was bespoke Kuadrant policies per model).
   oc delete authpolicy --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
   oc delete ratelimitpolicy --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
   oc delete tokenratelimitpolicy --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
   oc delete rolebinding --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
+
+  # MaaSSubscription/MaaSAuthPolicy live in models-as-a-service (fixed by the CRD, not
+  # maas-models), and that namespace is owned by RHOAI — delete only the named example
+  # resources, not the namespace itself.
+  oc delete maassubscription llama-3-8b-free -n models-as-a-service --ignore-not-found 2>/dev/null || true
+  oc delete maasauthpolicy llama-3-8b-access -n models-as-a-service --ignore-not-found 2>/dev/null || true
+
   log_info "Waiting 15 s for controller to clean up dependent resources…"
   sleep 15
   oc delete namespace "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
@@ -144,9 +156,10 @@ revert_llamastack_operator() {
 
 delete_maas_gateway() {
   log_step "Deleting MaaS gateway"
+  oc delete route maas-default-gateway -n openshift-ingress --ignore-not-found 2>/dev/null || true
   oc delete gateway maas-default-gateway -n openshift-ingress --ignore-not-found 2>/dev/null || true
   oc delete configmap maas-default-gateway-config -n openshift-ingress --ignore-not-found 2>/dev/null || true
-  log_ok "Gateway 'maas-default-gateway' deleted."
+  log_ok "Gateway 'maas-default-gateway' and its Route deleted."
 }
 
 revert_authorino_tls() {
@@ -159,6 +172,10 @@ revert_authorino_tls() {
   else
     log_warn "Authorino CR not found — skipping patch."
   fi
+  oc annotate service authorino-authorino-authorization -n "$KUADRANT_NS" \
+    service.beta.openshift.io/serving-cert-secret-name- 2>/dev/null || true
+  oc delete secret authorino-server-cert -n "$KUADRANT_NS" --ignore-not-found 2>/dev/null || true
+  # Leftover cleanup for clusters that ran an older version of this script (cert-manager-based TLS).
   oc delete certificate authorino-tls -n "$KUADRANT_NS" --ignore-not-found 2>/dev/null || true
   oc delete secret authorino-tls-secret -n "$KUADRANT_NS" --ignore-not-found 2>/dev/null || true
   oc delete clusterissuer maas-self-signed --ignore-not-found 2>/dev/null || true

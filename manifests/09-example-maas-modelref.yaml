@@ -1,0 +1,14 @@
+# MaaSModelRef — publishes the example LLMInferenceService to Models-as-a-Service.
+# Registers the model so it becomes discoverable via GET /maas-api/v1/models and
+# callable via /llm/llama-3-8b/v1/... through the MaaS gateway. Publishing a model
+# grants no access by itself — see 10-example-maas-subscription.yaml and
+# 11-example-maas-auth-policy.yaml for that.
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSModelRef
+metadata:
+  name: llama-3-8b
+  namespace: maas-models
+spec:
+  modelRef:
+    kind: LLMInferenceService
+    name: llama-3-8b

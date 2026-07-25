@@ -1,0 +1,18 @@
+# MaaSSubscription — grants system:authenticated users a token quota for the
+# example model. Must live in the models-as-a-service namespace (fixed by the CRD).
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
+metadata:
+  name: llama-3-8b-free
+  namespace: models-as-a-service
+spec:
+  owner:
+    groups:
+      - name: system:authenticated
+  modelRefs:
+    - name: llama-3-8b
+      namespace: maas-models
+      tokenRateLimits:
+        - limit: 100000
+          window: 24h
+  priority: 10

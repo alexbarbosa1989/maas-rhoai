@@ -241,25 +241,57 @@ configure_maas_gateway() {
     done
     log_ok "Gateway 'maas-default-gateway' is Programmed."
   fi
+
+  # Expose the gateway externally. RHOAI does not create this Route automatically;
+  # without it, maas-api and every model endpoint are only reachable from inside the
+  # cluster network.
+  if resource_exists route maas-default-gateway "openshift-ingress"; then
+    log_warn "Route 'maas-default-gateway' already exists — skipping."
+  else
+    local apps_domain
+    apps_domain=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
+    sed "s|maas\.APPS_DOMAIN_PLACEHOLDER|maas.${apps_domain}|" \
+      "${MANIFESTS_DIR}/06g-maas-gateway-route.yaml" | oc apply -f -
+
+    log_info "Waiting for Route 'maas-default-gateway' to be admitted…"
+    local deadline=$(( $(date +%s) + 60 ))
+    until [[ "$(oc get route maas-default-gateway -n openshift-ingress \
+                  -o jsonpath='{.status.ingress[0].conditions[?(@.type=="Admitted")].status}' 2>/dev/null)" == "True" ]]; do
+      if (( $(date +%s) > deadline )); then
+        log_error "Route 'maas-default-gateway' not admitted after 60s."
+        oc describe route maas-default-gateway -n openshift-ingress 2>/dev/null | tail -15
+        exit 1
+      fi
+      sleep 5
+    done
+    log_ok "Route 'maas-default-gateway' admitted at https://maas.${apps_domain}"
+  fi
 }
 
 configure_authorino_tls() {
   log_step "Step 5: Configuring Authorino TLS (required by MaaS auth layer)"
 
   if oc get authorino authorino -n "$KUADRANT_NS" \
-      -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null | grep -q "true"; then
-    log_warn "Authorino TLS already enabled — skipping."
+      -o jsonpath='{.spec.listener.tls.certSecretRef.name}' 2>/dev/null | grep -q "^authorino-server-cert$"; then
+    log_warn "Authorino TLS already enabled with the service-ca cert — skipping."
     return 0
   fi
 
-  apply_manifest "${MANIFESTS_DIR}/06e-authorino-tls.yaml"
+  # The Gateway's security.opendatahub.io/authorino-tls-bootstrap annotation makes
+  # maas-controller create an EnvoyFilter that trusts the cluster's internal service-ca
+  # for its connection to Authorino. Authorino's own server cert must therefore be issued
+  # by that same service-ca (not a self-signed one), or the Envoy↔Authorino gRPC TLS
+  # handshake fails with "gRPC status code is not OK" and every MaaS API call 500s.
+  oc annotate service authorino-authorino-authorization -n "$KUADRANT_NS" \
+    service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
+    --overwrite
 
-  log_info "Waiting for Authorino TLS Secret to be issued by cert-manager…"
+  log_info "Waiting for Authorino TLS Secret to be issued by the service-ca operator…"
   local deadline=$(( $(date +%s) + 120 ))
-  until oc get secret authorino-tls-secret -n "$KUADRANT_NS" &>/dev/null; do
+  until oc get secret authorino-server-cert -n "$KUADRANT_NS" &>/dev/null; do
     if (( $(date +%s) > deadline )); then
       log_error "Authorino TLS Secret not issued after 120s."
-      oc describe certificate authorino-tls -n "$KUADRANT_NS" 2>/dev/null | tail -10
+      oc describe service authorino-authorino-authorization -n "$KUADRANT_NS" 2>/dev/null | tail -10
       exit 1
     fi
     sleep 5
@@ -271,11 +303,16 @@ configure_authorino_tls() {
       "listener": {
         "tls": {
           "enabled": true,
-          "certSecretRef": {"name": "authorino-tls-secret"}
+          "certSecretRef": {"name": "authorino-server-cert"}
         }
       }
     }
   }'
+  # Lets Authorino's own outbound HTTPS calls (e.g. maas-api API-key validation) trust
+  # certs signed by the same cluster service-ca.
+  oc -n "$KUADRANT_NS" set env deployment/authorino \
+    SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca.crt
   log_ok "Authorino patched with TLS configuration."
   # Use rollout status rather than pod polling — the patch triggers a rolling restart,
   # so there is a window where the old pod is terminating and the new one hasn't appeared
@@ -557,14 +594,19 @@ print_summary() {
     echo -e "  with --hardware-profile-name <name> when you deploy the example model."
     echo
   fi
-  echo -e "  1. Deploy the example model, governance policies, and LlamaStack playground:"
+  echo -e "  1. Deploy the example model and MaaS governance (MaaSModelRef/Subscription/AuthPolicy):"
   echo -e "     ./deploy-example-workload.sh"
   echo
-  echo -e "  2. Users call the model API with their OpenShift bearer token:"
+  local apps_domain
+  apps_domain=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null || echo "<apps-domain>")
+  echo -e "  2. Users mint a MaaS API key, then call the model through it:"
   echo -e "     TOKEN=\$(oc whoami -t)"
-  echo -e "     curl -H \"Authorization: Bearer \$TOKEN\" \\"
-  echo -e "       https://llama-3-8b-maas-models.${domain}/v1/chat/completions \\"
-  echo -e "       -d '{\"model\":\"llama-3-1-8b-instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
+  echo -e "     API_KEY=\$(curl -sk -X POST https://maas.${apps_domain}/maas-api/v1/api-keys \\"
+  echo -e "       -H \"Authorization: Bearer \$TOKEN\" -H \"Content-Type: application/json\" \\"
+  echo -e "       -d '{\"name\":\"my-key\",\"subscription\":\"llama-3-8b-free\",\"expiresIn\":\"1h\"}' | jq -r .key)"
+  echo -e "     curl -sk -H \"Authorization: Bearer \$API_KEY\" -H \"Content-Type: application/json\" \\"
+  echo -e "       https://maas.${apps_domain}/${MAAS_MODEL_NS}/llama-3-8b/v1/chat/completions \\"
+  echo -e "       -d '{\"model\":\"llama-3-8b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
   echo
   echo -e "  ${BOLD}RHOAI Dashboard:${NC}"
   echo -e "  $(oc get route rhods-dashboard -n "$RHOAI_APP_NS" \

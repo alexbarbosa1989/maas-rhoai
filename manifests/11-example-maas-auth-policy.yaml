@@ -1,0 +1,16 @@
+# MaaSAuthPolicy — grants system:authenticated users API-gateway access to the
+# example model. Independent of the subscription above (per the official docs,
+# subscriptions and authorization policies are separate resources — keep the
+# subjects here in sync with the subscription's owner if either changes).
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSAuthPolicy
+metadata:
+  name: llama-3-8b-access
+  namespace: models-as-a-service
+spec:
+  subjects:
+    groups:
+      - name: system:authenticated
+  modelRefs:
+    - name: llama-3-8b
+      namespace: maas-models

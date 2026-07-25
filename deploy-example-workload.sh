@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # deploy-example-workload.sh
 # Deploys the example MaaS workload on top of a platform already configured by
-# setup-maas.sh: an LLMInferenceService, governance policies (AuthPolicy,
-# RateLimitPolicy, TokenRateLimitPolicy), an RBAC viewer binding, and (optionally)
-# a LlamaStackDistribution for the RHOAI GenAI Playground.
+# setup-maas.sh: an LLMInferenceService, MaaS governance (MaaSModelRef,
+# MaaSSubscription, MaaSAuthPolicy), and (optionally) a LlamaStackDistribution
+# for the RHOAI GenAI Playground.
 #
 # This is a separate script from setup-maas.sh on purpose: the platform layer
 # (operators, gateway, Authorino TLS, DSC/dashboard flags) is close to one-shot,
@@ -52,8 +52,8 @@ parse_args() {
         shift 2 ;;
       --help)
         cat <<'USAGE'
-deploy-example-workload.sh — Deploys the example MaaS workload (model, governance
-policies, RBAC, LlamaStack playground) on top of a platform configured by setup-maas.sh.
+deploy-example-workload.sh — Deploys the example MaaS workload (model, MaaS governance,
+LlamaStack playground) on top of a platform configured by setup-maas.sh.
 
 Usage:
   ./deploy-example-workload.sh [OPTIONS]
@@ -68,9 +68,14 @@ Options:
 
 Deploys, in order:
   1. LLMInferenceService 'llama-3-8b' (manifests/08)
-  2. AuthPolicy, RateLimitPolicy, TokenRateLimitPolicy (manifests/09-11)
-  3. RoleBinding granting 'view' to group maas-users (manifests/12)
-  4. LlamaStackDistribution for the GenAI Playground (manifests/13), unless --skip-llamastack
+  2. MaaSModelRef, MaaSSubscription, MaaSAuthPolicy (manifests/09-11) — publishes the
+     model to MaaS and grants system:authenticated users a 100k-tokens/24h quota
+  3. LlamaStackDistribution for the GenAI Playground (manifests/13), unless --skip-llamastack
+
+Once published, the model is callable externally via the MaaS gateway at
+https://maas.<apps-domain>/maas-models/llama-3-8b/v1/chat/completions, authenticated with a
+MaaS API key (not a raw OpenShift token) — see the summary printed at the end for the
+exact commands to mint one.
 
 HardwareProfile resolution order for step 1 (opendatahub.io/hardware-profile-name annotation):
   1. --hardware-profile-name / HARDWARE_PROFILE_NAME, if set
@@ -179,18 +184,23 @@ deploy_llminferenceservice() {
   done
 }
 
-apply_governance_policies() {
-  log_step "Step 3: Applying governance policies (AuthPolicy, RateLimitPolicy, TokenRateLimitPolicy)"
-  apply_manifest "${MANIFESTS_DIR}/09-example-auth-policy.yaml"
-  apply_manifest "${MANIFESTS_DIR}/10-example-ratelimit-policy.yaml"
-  apply_manifest "${MANIFESTS_DIR}/11-example-token-ratelimit-policy.yaml"
-  log_ok "Governance policies applied."
-}
+publish_maas_governance() {
+  log_step "Step 3: Publishing to MaaS (MaaSModelRef, MaaSSubscription, MaaSAuthPolicy)"
+  apply_manifest "${MANIFESTS_DIR}/09-example-maas-modelref.yaml"
+  apply_manifest "${MANIFESTS_DIR}/10-example-maas-subscription.yaml"
+  apply_manifest "${MANIFESTS_DIR}/11-example-maas-auth-policy.yaml"
 
-grant_rbac() {
-  log_step "Step 4: Granting user/group access to the model namespace"
-  apply_manifest "${MANIFESTS_DIR}/12-example-rbac-viewer.yaml"
-  log_ok "RBAC viewer binding applied."
+  log_info "Waiting for MaaSModelRef 'llama-3-8b' to reach phase Ready…"
+  local deadline=$(( $(date +%s) + 60 ))
+  until [[ "$(oc get maasmodelref llama-3-8b -n "$MAAS_MODEL_NS" \
+                -o jsonpath='{.status.phase}' 2>/dev/null)" == "Ready" ]]; do
+    if (( $(date +%s) > deadline )); then
+      log_warn "MaaSModelRef not Ready within 60s — check manually: oc get maasmodelref llama-3-8b -n ${MAAS_MODEL_NS} -o yaml"
+      break
+    fi
+    sleep 5
+  done
+  log_ok "MaaS governance published."
 }
 
 deploy_llamastack() {
@@ -258,13 +268,15 @@ deploy_llamastack() {
 print_summary() {
   log_step "Example workload deployment — Summary"
 
-  local domain
-  domain=$(oc get gatewayconfig default-gateway -n "$RHOAI_APP_NS" \
-    -o jsonpath='{.status.domain}' 2>/dev/null || echo "<domain>")
+  local apps_domain maas_url
+  apps_domain=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null || echo "<apps-domain>")
+  maas_url="https://maas.${apps_domain}"
 
-  local model_ready llamastack_state
+  local model_ready modelref_phase llamastack_state
   model_ready=$(oc get llminferenceservice llama-3-8b -n "$MAAS_MODEL_NS" \
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "N/A")
+  modelref_phase=$(oc get maasmodelref llama-3-8b -n "$MAAS_MODEL_NS" \
+    -o jsonpath='{.status.phase}' 2>/dev/null || echo "N/A")
   llamastack_state="skipped"
   [[ "$SKIP_LLAMASTACK" != "true" ]] && llamastack_state=$(oc get pods -n "$MAAS_MODEL_NS" -l app=llama-stack \
     --field-selector=status.phase=Running 2>/dev/null | grep -c Running || echo 0)
@@ -274,10 +286,10 @@ print_summary() {
   echo -e "${BOLD}${CYAN}║          MaaS Example Workload — Summary                     ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
   echo
-  echo -e "  LLMInferenceService 'llama-3-8b' Ready   ${model_ready}"
-  echo -e "  HardwareProfile used                      ${RESOLVED_HW_PROFILE}"
-  echo -e "  Governance policies (AuthPolicy/RLP/TRLP) applied"
-  echo -e "  RBAC viewer binding                       applied"
+  echo -e "  LLMInferenceService 'llama-3-8b' Ready    ${model_ready}"
+  echo -e "  HardwareProfile used                       ${RESOLVED_HW_PROFILE}"
+  echo -e "  MaaSModelRef phase                         ${modelref_phase}"
+  echo -e "  MaaSSubscription + MaaSAuthPolicy applied  (system:authenticated, 100k tokens/24h)"
   if [[ "$SKIP_LLAMASTACK" == "true" ]]; then
     echo -e "  LlamaStack (GenAI Playground)             skipped (--skip-llamastack)"
   else
@@ -286,20 +298,23 @@ print_summary() {
   echo
   echo -e "  ${BOLD}Inspect resources:${NC}"
   echo -e "     oc get llminferenceservice -n ${MAAS_MODEL_NS}"
-  echo -e "     oc get authpolicy,ratelimitpolicy,tokenratelimitpolicy -n ${MAAS_MODEL_NS}"
-  echo -e "     oc get httproute -n ${MAAS_MODEL_NS}"
+  echo -e "     oc get maasmodelref -n ${MAAS_MODEL_NS}"
+  echo -e "     oc get maassubscription,maasauthpolicy -n models-as-a-service"
   [[ "$SKIP_LLAMASTACK" != "true" ]] && echo -e "     oc get llamastackdistribution -n ${MAAS_MODEL_NS}"
   echo
-  echo -e "  ${BOLD}Call the model API with an OpenShift bearer token:${NC}"
+  echo -e "  ${BOLD}Call the model API (mint a MaaS API key, then use it):${NC}"
   echo -e "     TOKEN=\$(oc whoami -t)"
-  echo -e "     curl -H \"Authorization: Bearer \$TOKEN\" \\"
-  echo -e "       https://llama-3-8b-maas-models.${domain}/v1/chat/completions \\"
-  echo -e "       -d '{\"model\":\"llama-3-1-8b-instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
+  echo -e "     API_KEY=\$(curl -sk -X POST ${maas_url}/maas-api/v1/api-keys \\"
+  echo -e "       -H \"Authorization: Bearer \$TOKEN\" -H \"Content-Type: application/json\" \\"
+  echo -e "       -d '{\"name\":\"my-key\",\"subscription\":\"llama-3-8b-free\",\"expiresIn\":\"1h\"}' | jq -r .key)"
+  echo -e "     curl -sk -H \"Authorization: Bearer \$API_KEY\" -H \"Content-Type: application/json\" \\"
+  echo -e "       ${maas_url}/${MAAS_MODEL_NS}/llama-3-8b/v1/chat/completions \\"
+  echo -e "       -d '{\"model\":\"llama-3-8b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
   echo
   echo -e "  Re-run this script any time to reapply the workload (all steps are idempotent)."
-  echo -e "  To remove it: oc delete -f manifests/08-example-llminferenceservice.yaml -f manifests/09-example-auth-policy.yaml \\"
-  echo -e "                   -f manifests/10-example-ratelimit-policy.yaml -f manifests/11-example-token-ratelimit-policy.yaml \\"
-  echo -e "                   -f manifests/12-example-rbac-viewer.yaml -f manifests/13-llamastack-distribution.yaml"
+  echo -e "  To remove it: oc delete -f manifests/08-example-llminferenceservice.yaml -f manifests/09-example-maas-modelref.yaml \\"
+  echo -e "                   -f manifests/10-example-maas-subscription.yaml -f manifests/11-example-maas-auth-policy.yaml \\"
+  echo -e "                   -f manifests/13-llamastack-distribution.yaml"
   echo
 }
 
@@ -316,8 +331,7 @@ main() {
 
   check_prerequisites
   deploy_llminferenceservice
-  apply_governance_policies
-  grant_rbac
+  publish_maas_governance
   deploy_llamastack
   print_summary
 }

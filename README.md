@@ -7,15 +7,17 @@ Automates the full MaaS configuration on **Red Hat OpenShift AI 3.4** as describ
 
 ## What MaaS does
 
-MaaS lets a **platform team** deploy LLMs once and expose them as governed API endpoints. User teams (data scientists, developers) call those endpoints with their OpenShift credentials and are automatically subject to:
+MaaS lets a **platform team** deploy LLMs once and expose them as governed, subscription-based API endpoints through a single gateway hostname (`maas.<apps-domain>`). User teams (data scientists, developers) mint a MaaS API key and call `https://maas.<apps-domain>/<namespace>/<model-name>/v1/...`, automatically subject to:
 
 | Feature | Mechanism |
 |---|---|
-| Authentication | K8s token review (OpenShift SA/user tokens) or OIDC |
-| Authorization | Kubernetes SubjectAccessReview (RBAC) |
-| Rate limiting | RHCL `RateLimitPolicy` (requests/window per user) |
-| Token quotas | RHCL `TokenRateLimitPolicy` (LLM tokens/day per user) |
+| Publishing | `MaaSModelRef` — registers an `LLMInferenceService` (or `ExternalModel`) with MaaS |
+| Authorization | `MaaSAuthPolicy` — grants groups/users API-gateway access to specific models |
+| Quota / rate limiting | `MaaSSubscription` — token-rate-limit quotas per group/user, with priority tiers |
+| Authentication | MaaS API keys (`sk-oai-...`) or OpenShift/OIDC bearer tokens for the management API |
 | TLS | cert-manager + OpenShift service-serving certificates |
+
+Underneath, these MaaS-native CRDs are enforced by RHCL (Kuadrant) `AuthPolicy`/`TokenRateLimitPolicy` objects that the platform manages automatically at the gateway level — you configure MaaS resources, not raw Kuadrant policies, for model governance.
 
 ---
 
@@ -174,23 +176,24 @@ New CRDs provided by RHCL:
 ### Step 4 — Create MaaS Gateway
 Creates the **Gateway API `Gateway`** resource that the MaaS controller expects at `openshift-ingress/maas-default-gateway`. RHOAI does **not** auto-create this; without it the `Tenant/default-tenant` reconciliation fails.
 
-The gateway uses `data-science-gateway-class` and references a ConfigMap (`maas-default-gateway-config`) that instructs OpenShift to auto-generate a TLS certificate for the gateway's LoadBalancer service via the `service.beta.openshift.io/serving-cert-secret-name` annotation.
+The gateway uses `data-science-gateway-class` (whose controller is the built-in `openshift.io/gateway-controller`) and references a ConfigMap (`maas-default-gateway-config`) that instructs OpenShift to auto-generate a TLS certificate for the gateway's service via the `service.beta.openshift.io/serving-cert-secret-name` annotation. It carries two annotations required by the official docs: `opendatahub.io/managed: "false"` (so the ODH Model Controller doesn't override MaaS-managed auth policies) and `security.opendatahub.io/authorino-tls-bootstrap: "true"` (triggers an `EnvoyFilter` for TLS between the Gateway and Authorino).
+
+The Gateway's own backing Service is `ClusterIP` — it has no external IP by itself. This step also creates an OpenShift `Route` (`maas-default-gateway` in `openshift-ingress`, host `maas.<apps-domain>`) so the gateway — and everything behind it, including `maas-api` and every published model — is reachable from outside the cluster.
 
 ```
 manifests/06b-maas-gateway-configmap.yaml   # ConfigMap triggering OCP TLS cert generation
 manifests/06c-maas-gateway.yaml             # Gateway resource (openshift-ingress namespace)
+manifests/06g-maas-gateway-route.yaml       # External Route (host templated with the cluster's apps domain)
 ```
 
 ### Step 5 — Enable Authorino TLS
-RHCL deploys Authorino with TLS **disabled** by default. MaaS requires Authorino's gRPC listener to use TLS. This step:
+RHCL deploys Authorino with TLS **disabled** by default. MaaS requires Authorino's gRPC listener to use TLS, and — because the Gateway carries the `security.opendatahub.io/authorino-tls-bootstrap` annotation (Step 4), which makes `maas-controller` create an `EnvoyFilter` that trusts the cluster's **internal service-ca** for the Envoy↔Authorino connection — Authorino's own server cert must be issued by that same CA, not a self-signed one. This step:
 
-1. Creates a self-signed `ClusterIssuer` (`maas-self-signed`) via cert-manager
-2. Issues a `Certificate` (`authorino-tls`) in `kuadrant-system` with DNS SANs for `authorino.kuadrant-system.svc`
-3. Patches the `Authorino` CR to enable TLS and point to the generated secret
+1. Annotates the `authorino-authorino-authorization` Service with `service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert`, so OpenShift's service-ca operator issues a cert into that Secret
+2. Patches the `Authorino` CR to enable TLS and point `certSecretRef` at `authorino-server-cert`
+3. Sets `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` on the Authorino deployment so its own outbound HTTPS calls (e.g. `maas-api` API-key validation) also trust the cluster CA
 
-```
-manifests/06e-authorino-tls.yaml   # ClusterIssuer + Certificate
-```
+> Using a self-signed cert-manager cert here instead (an earlier version of this script did) causes the Envoy↔Authorino gRPC handshake to fail with `gRPC status code is not OK`, and every MaaS API call — including minting API keys — returns a generic 500.
 
 ### Step 6 — Deploy PostgreSQL
 `maas-api` requires a PostgreSQL database. This step deploys a single-replica PostgreSQL 15 StatefulSet in a dedicated `maas-db` namespace using the OpenShift internal image registry, and creates the `maas-db-config` Secret in `redhat-ods-applications` containing the connection URL.
@@ -253,10 +256,9 @@ Creates the `maas-models` namespace with the `opendatahub.io/dashboard: "true"` 
 Not part of `setup-maas.sh` — run `./deploy-example-workload.sh` separately once the platform is up. Deploys:
 
 - `llama-3-8b` LLMInferenceService (llama-3.1-8B-Instruct FP8, OCI modelcar from `registry.redhat.io/rhelai1`)
-- `AuthPolicy` — K8s token review + SubjectAccessReview
-- `RateLimitPolicy` — 10 req/10 s per user, 100 req/10 s global
-- `TokenRateLimitPolicy` — 100 000 tokens/day per user
-- `RoleBinding` — grants `view` ClusterRole to group `maas-users`
+- `MaaSModelRef` — publishes the model to MaaS (discoverable via `GET /maas-api/v1/models`)
+- `MaaSSubscription` — grants `system:authenticated` a 100,000-tokens/24h quota
+- `MaaSAuthPolicy` — grants `system:authenticated` API-gateway access to the model
 - `LlamaStackDistribution` for the GenAI Playground, unless `--skip-llamastack` is passed
 
 > **GPU requirement:** The example model requires a GPU node with FP8 support (NVIDIA H100/H200 recommended). Resources are sized to the cluster HardwareProfile: 2–4 CPU, 4–8 GiB memory, 1 GPU. On clusters without a matching GPU node the pod will remain Pending — the HTTPRoute and governance policies are still created and verifiable.
@@ -288,14 +290,13 @@ maas-rhoai/
     ├── 06b-maas-gateway-configmap.yaml        # ConfigMap for gateway TLS cert annotation
     ├── 06c-maas-gateway.yaml                  # maas-default-gateway Gateway resource
     ├── 06d-maas-postgresql.yaml               # PostgreSQL for maas-api + DB config Secret
-    ├── 06e-authorino-tls.yaml                 # ClusterIssuer + Certificate for Authorino TLS
     ├── 06f-user-workload-monitoring.yaml      # Enables OpenShift User Workload Monitoring
+    ├── 06g-maas-gateway-route.yaml            # External Route exposing the gateway (host templated)
     ├── 07-model-namespace.yaml                # maas-models namespace
     ├── 08-example-llminferenceservice.yaml    # Example LLMInferenceService (llama-3.1-8B FP8, OCI)
-    ├── 09-example-auth-policy.yaml            # AuthPolicy for the example model
-    ├── 10-example-ratelimit-policy.yaml       # RateLimitPolicy (req/s per user)
-    ├── 11-example-token-ratelimit-policy.yaml # TokenRateLimitPolicy (tokens/day per user)
-    ├── 12-example-rbac-viewer.yaml            # RoleBinding: group maas-users → view
+    ├── 09-example-maas-modelref.yaml          # MaaSModelRef publishing the model to MaaS
+    ├── 10-example-maas-subscription.yaml      # MaaSSubscription (token quota + owner groups/users)
+    ├── 11-example-maas-auth-policy.yaml       # MaaSAuthPolicy (API-gateway access grant)
     └── 13-llamastack-distribution.yaml        # LlamaStack distribution for the GenAI Playground
 ```
 
@@ -303,7 +304,8 @@ maas-rhoai/
 
 ## Deploying your own model
 
-After the platform is configured, deploying a new LLM is a three-step process.
+After the platform is configured, deploying a new LLM is a three-step process: create the
+`LLMInferenceService`, publish it to MaaS with the three MaaS-native CRDs, then call it.
 
 ### 1. Create the LLMInferenceService
 
@@ -363,86 +365,94 @@ oc get llminferenceservice my-llm -n maas-models -w
 oc get httproute -n maas-models
 ```
 
-### 2. Apply governance policies
+### 2. Publish it to MaaS
 
-Once the `HTTPRoute` is created (name matches the `LLMInferenceService` name):
+Three MaaS-native custom resources, applied in order (see §1.17.2 of the official docs):
 
 ```bash
-# Auth policy (replace 'my-llm' with your HTTPRoute name)
+# MaaSModelRef — publishes the model (replace 'my-llm' throughout)
 oc apply -f - <<EOF
-apiVersion: kuadrant.io/v1
-kind: AuthPolicy
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSModelRef
 metadata:
-  name: my-llm-auth
+  name: my-llm
   namespace: maas-models
 spec:
-  targetRef:
-    group: gateway.networking.k8s.io
-    kind: HTTPRoute
+  modelRef:
+    kind: LLMInferenceService
     name: my-llm
-  rules:
-    authentication:
-      k8s-token:
-        kubernetesTokenReview:
-          audiences: []
-    authorization:
-      namespace-access:
-        kubernetesSubjectAccessReview:
-          user:
-            valueFrom:
-              authJSON: auth.identity.user.username
-          resourceAttributes:
-            namespace:
-              value: maas-models
-            group:
-              value: serving.kserve.io
-            resource:
-              value: llminferenceservices
-            verb:
-              value: get
 EOF
 
-# Rate-limit policy
+# MaaSSubscription — token quota and eligible groups/users (must live in models-as-a-service)
 oc apply -f - <<EOF
-apiVersion: kuadrant.io/v1
-kind: RateLimitPolicy
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
 metadata:
-  name: my-llm-rate-limit
-  namespace: maas-models
+  name: my-llm-free
+  namespace: models-as-a-service
 spec:
-  targetRef:
-    group: gateway.networking.k8s.io
-    kind: HTTPRoute
-    name: my-llm
-  limits:
-    per-user-rps:
-      rates:
-      - limit: 10
-        window: 10s
-      counters:
-      - expression: auth.identity.user.username
+  owner:
+    groups:
+      - name: data-scientists
+  modelRefs:
+    - name: my-llm
+      namespace: maas-models
+      tokenRateLimits:
+        - limit: 100000
+          window: 24h
+  priority: 10
+EOF
+
+# MaaSAuthPolicy — grants the same groups/users API-gateway access (independent
+# resource — keep subjects in sync with the subscription's owner if either changes)
+oc apply -f - <<EOF
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSAuthPolicy
+metadata:
+  name: my-llm-access
+  namespace: models-as-a-service
+spec:
+  subjects:
+    groups:
+      - name: data-scientists
+  modelRefs:
+    - name: my-llm
+      namespace: maas-models
 EOF
 ```
 
-### 3. Grant user access
-
+Verify:
 ```bash
-# Grant the 'data-scientists' group read access to the model namespace
-oc adm policy add-role-to-group view data-scientists -n maas-models
+oc get maasmodelref my-llm -n maas-models -o jsonpath='{.status.phase}'   # expect: Ready
+oc get maasauthpolicy my-llm-access -n models-as-a-service -o jsonpath='{.status.phase}'   # expect: Active
 ```
 
-### 4. Call the API
+### 3. Call the API
+
+Inference goes through the single MaaS gateway hostname, authenticated with a **MaaS API
+key** (not a raw OpenShift bearer token) — mint one against the management API first:
 
 ```bash
+APPS_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
+MAAS_URL="https://maas.${APPS_DOMAIN}"
 TOKEN=$(oc whoami -t)
-DOMAIN=$(oc get gatewayconfig default-gateway -n redhat-ods-applications \
-  -o jsonpath='{.status.domain}')
 
-curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://my-llm-maas-models.${DOMAIN}/v1/chat/completions" \
+# Mint an API key scoped to your subscription
+API_KEY=$(curl -sk -X POST "${MAAS_URL}/maas-api/v1/api-keys" \
+  -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
+  -d '{"name":"my-key","subscription":"my-llm-free","expiresIn":"30d"}' | jq -r .key)
+
+# List models available to you
+curl -sk -H "Authorization: Bearer ${API_KEY}" "${MAAS_URL}/maas-api/v1/models" | jq
+
+# Call the model — path is /<namespace>/<model-name>/v1/..., not /llm/<model-name>/v1/...
+# (that's what the official docs describe, but it isn't wired up as an HTTPRoute on
+# every RHOAI 3.4.x build — check `oc get httproute -n <namespace>` if this 404s for you)
+curl -sk -H "Authorization: Bearer ${API_KEY}" \
+  "${MAAS_URL}/maas-models/my-llm/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama-3-1-8b-instruct",
+    "model": "my-llm",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
@@ -461,10 +471,11 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 
 ### What gets removed
 
-- All `LlamaStackDistribution`, `LLMInferenceService`, `AuthPolicy`, `RateLimitPolicy`, `TokenRateLimitPolicy`, and `RoleBinding` resources in `maas-models`, then the `maas-models` namespace itself
+- All `LlamaStackDistribution`, `LLMInferenceService`, and `MaaSModelRef` resources in `maas-models`, then the `maas-models` namespace itself
+- `MaaSSubscription`/`MaaSAuthPolicy` for the example model in `models-as-a-service` (the namespace itself is left in place — it's owned by RHOAI)
 - DSC `kserve.modelsAsService` reverted to `Removed`
 - DSC `llamastackoperator` reverted to `Removed` — **conditionally**: since `llamastackoperator` is a cluster-scoped DSC component that may back LlamaStack workloads outside MaaS, the script first deletes the MaaS `LlamaStackDistribution` and then checks `oc get llamastackdistribution -A` cluster-wide. It only reverts the operator to `Removed` if none remain; otherwise it logs a warning and leaves it `Managed`.
-- Gateway `maas-default-gateway` (and its ConfigMap) in `openshift-ingress`
+- Gateway `maas-default-gateway`, its external `Route`, and its ConfigMap, all in `openshift-ingress`
 - Authorino TLS patch reverted; `Certificate` and `ClusterIssuer` deleted
 - PostgreSQL (`maas-db` namespace + `maas-db-config` Secret)
 
@@ -502,9 +513,15 @@ oc delete pod -n redhat-ods-applications -l app.kubernetes.io/name=maas-api
 ```bash
 oc get authorino authorino -n kuadrant-system \
   -o jsonpath='{.spec.listener.tls}' | python3 -m json.tool
-oc get secret authorino-tls-secret -n kuadrant-system
-oc logs -n kuadrant-system -l app=authorino --tail=50
+oc get secret authorino-server-cert -n kuadrant-system
+oc logs -n kuadrant-system -l control-plane=controller-manager --tail=50
 ```
+`certSecretRef.name` must be `authorino-server-cert` (issued by the OpenShift service-ca
+operator). If it's a different, self-signed secret, every MaaS API call will 500 with
+`gRPC status code is not OK` in the gateway's Envoy logs — the Envoy↔Authorino handshake
+fails because the `EnvoyFilter` `maas-default-gateway-authn-ssl` only trusts the cluster's
+internal service-ca, not an arbitrary self-signed one. Re-run `configure_authorino_tls()`'s
+steps manually (see Step 5 above) to fix it.
 
 ### DSC stuck / ModelsAsServiceReady never True
 ```bash
@@ -540,26 +557,42 @@ oc describe pod -n maas-models <pod-name>
 ```
 Common causes: no GPU node with FP8 support available, insufficient memory, OCI pull secret not configured for `registry.redhat.io`.
 
-### AuthPolicy not enforcing
+### MaaSAuthPolicy / MaaSSubscription not granting access
 ```bash
-oc get authpolicy -n maas-models
-oc describe authpolicy <name> -n maas-models
-oc logs -n kuadrant-system -l app=authorino --tail=50
+oc get maasmodelref,maasauthpolicy,maassubscription -A
+oc get maasauthpolicy <name> -n models-as-a-service -o jsonpath='{.status.phase}'   # expect: Active
+oc get maasmodelref <name> -n <namespace> -o jsonpath='{.status.phase}'             # expect: Ready
+```
+Authorization and subscription are independent resources — if you change a subscription's
+groups/models, update the matching `MaaSAuthPolicy` too (they're not auto-synced). Check the
+underlying gateway-level Kuadrant enforcement if both show healthy but requests still fail:
+```bash
+oc get authpolicy -n openshift-ingress
+oc logs -n kuadrant-system -l control-plane=controller-manager --tail=50
 ```
 
-### AuthPolicy rejected: `kubernetesSubjectAccessReview.groups` must be of type array
-The RHCL `AuthPolicy` v1 CRD deprecated the object-style `groups.valueFrom.authJSON` selector in
-favor of a top-level `authorizationGroups` field (also `groups` itself is now typed as a static
-string array, not a selector object). `manifests/09-example-auth-policy.yaml` uses the current
-`user.selector` / `authorizationGroups.selector` syntax — if you copy this pattern elsewhere, use:
-```yaml
-kubernetesSubjectAccessReview:
-  user:
-    selector: auth.identity.user.username
-  authorizationGroups:
-    selector: auth.identity.user.groups
+### External API calls fail: "Application is not available" (503) or connection refused
+This means the request never reached the MaaS gateway at all — either DNS for
+`maas.<apps-domain>` doesn't resolve to your cluster, or the Route isn't admitted:
+```bash
+oc get route maas-default-gateway -n openshift-ingress
+# STATUS should NOT show RouteNotAdmitted or Pending
 ```
-not the older `valueFrom: { authJSON: ... }` form.
+If the Route shows `RouteNotAdmitted`, check whether it's colliding with a wildcard-route
+policy issue (`oc logs -n openshift-ingress -l ingresscontroller.operator.openshift.io/deployment-ingresscontroller=default | grep wildcard`)
+— `06g-maas-gateway-route.yaml` uses a single fixed hostname specifically to avoid needing
+`WildcardsAllowed` on the cluster's `IngressController`, so this shouldn't happen; if it does,
+something else already claimed that Route/host.
+
+### Inference call returns 404: `/llm/<model-name>/v1/...`
+The official docs describe `/llm/<model-name>/v1/...` as the inference path, but on some
+RHOAI 3.4.x builds no `HTTPRoute` actually implements that prefix — check with
+`oc get httproute -A -o json | jq -r '.items[].spec.rules[].matches[]?.path.value'`. The path
+that's actually wired up is the one KServe generates for the `LLMInferenceService` itself:
+`/<namespace>/<model-name>/v1/chat/completions` (e.g. `/maas-models/llama-3-8b/v1/chat/completions`
+for the example model — this is what `deploy-example-workload.sh`'s summary and `setup-maas.sh`'s
+"Next steps" print). Also make sure `-H "Content-Type: application/json"` is set — `maas-api`
+returns a 400 "Unsupported Media Type" without it, which is easy to mistake for a routing issue.
 
 ### GenAI Playground chat fails with "Server disconnected without sending a response"
 `LLMInferenceService` workload pods always serve TLS on port 8000 (via `SSLCertRefresher`), but a
