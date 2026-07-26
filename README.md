@@ -25,25 +25,29 @@ Underneath, these MaaS-native CRDs are enforced by RHCL (Kuadrant) `AuthPolicy`/
 
 ```
 Data Scientist / App
-        │
-        │  HTTPS + Bearer token
-        ▼
-┌──────────────────────────────────────────────────┐
-│  maas-default-gateway (openshift-ingress)        │
-│  Gateway API / data-science-gateway-class        │
-│  TLS: OpenShift service-serving cert             │
-└──────────────────┬───────────────────────────────┘
-                   │
-          ┌────────▼────────┐
-          │  Kuadrant/RHCL  │  Authorino (TLS gRPC)
-          │  AuthPolicy     │  tokenreview + SAR
-          │  RateLimitPolicy│  Limitador counter
-          └────────┬────────┘
-                   │
-          ┌────────▼────────────────────────┐
-          │  LLMInferenceService            │  serving.kserve.io/v1alpha2
-          │  (kserve + llmisvc-controller)  │
-          └─────────────────────────────────┘
+       │
+       │  HTTPS — one hostname: maas.<apps-domain>
+       │  (OpenShift bearer token for /maas-api/*, MaaS API key for inference)
+       ▼
+┌────────────────────────────────────────────────────────┐
+│  Route: maas-default-gateway (openshift-ingress)       │
+│  → maas-default-gateway Gateway (data-science-gateway- │
+│    class), TLS: OpenShift service-serving cert         │
+└───────────────────────┬──────────────────────────────────┘
+                        │  enforced by Kuadrant/RHCL AuthPolicy +
+                        │  Authorino (TLS gRPC, tokenreview/API-key validation)
+          ┌─────────────┴──────────────┐
+          ▼ /maas-api/*, /v1/models    ▼ /<namespace>/<model-name>/v1/*
+┌───────────────────────┐    ┌────────────────────────────┐
+│  maas-api             │    │  LLMInferenceService        │
+│  (API keys, model     │    │  HTTPRoute (per model)      │
+│  catalogue; requires  │    │  serving.kserve.io          │
+│  PostgreSQL)          │    │  (kserve + llmisvc-ctrlr)   │
+└───────────────────────┘    └────────────────────────────┘
+          ▲                              ▲
+          └──────────────┬───────────────┘
+                        │  governed by
+      MaaSModelRef (publish) · MaaSSubscription (quota) · MaaSAuthPolicy (access)
 ```
 
 ### Key components
@@ -54,7 +58,7 @@ Data Scientist / App
 | llmisvc-controller | `redhat-ods-applications` | Reconciles `LLMInferenceService` CRs |
 | model-serving-api | `redhat-ods-applications` | REST catalogue API for MaaS |
 | maas-api | `redhat-ods-applications` | MaaS platform API (requires PostgreSQL) |
-| maas-controller | `redhat-ods-applications` | Manages Tenant / MaaSAuthPolicy CRs |
+| maas-controller | `redhat-ods-applications` | Reconciles Tenant, MaaSModelRef, MaaSSubscription, and MaaSAuthPolicy CRs |
 | maas-default-gateway | `openshift-ingress` | Gateway API entry point for model endpoints |
 | cert-manager | `cert-manager-operator` | TLS certificate automation |
 | Kuadrant / RHCL | `kuadrant-system` | Auth, rate-limiting, DNS, TLS policies |
@@ -89,8 +93,8 @@ oc login https://api.<cluster>.<domain>:443 \
 # 3. Run the automation (installs everything end-to-end)
 ./setup-maas.sh
 
-# 4. Optionally deploy the example LLMInferenceService, governance policies,
-#    RBAC, and LlamaStack playground
+# 4. Optionally deploy the example LLMInferenceService, MaaS governance
+#    (MaaSModelRef/MaaSSubscription/MaaSAuthPolicy), and LlamaStack playground
 ./deploy-example-workload.sh
 ```
 
@@ -261,7 +265,7 @@ Not part of `setup-maas.sh` — run `./deploy-example-workload.sh` separately on
 - `MaaSAuthPolicy` — grants `system:authenticated` API-gateway access to the model
 - `LlamaStackDistribution` for the GenAI Playground, unless `--skip-llamastack` is passed
 
-> **GPU requirement:** The example model requires a GPU node with FP8 support (NVIDIA H100/H200 recommended). Resources are sized to the cluster HardwareProfile: 2–4 CPU, 4–8 GiB memory, 1 GPU. On clusters without a matching GPU node the pod will remain Pending — the HTTPRoute and governance policies are still created and verifiable.
+> **GPU requirement:** The example model requires a GPU node with FP8 support (NVIDIA H100/H200 recommended). Resources are sized to the cluster HardwareProfile: 2–4 CPU, 4–8 GiB memory, 1 GPU. On clusters without a matching GPU node the pod will remain Pending — the HTTPRoute and MaaS governance (MaaSModelRef/MaaSSubscription/MaaSAuthPolicy) are still created and verifiable.
 >
 > **Pull secret:** The OCI modelcar image is pulled from `registry.redhat.io` using the cluster's global pull secret — no HuggingFace token or additional Secret is required.
 
@@ -272,7 +276,7 @@ Not part of `setup-maas.sh` — run `./deploy-example-workload.sh` separately on
 ```
 maas-rhoai/
 ├── setup-maas.sh                              # Platform bootstrap (operators, gateway, DSC, dashboard flags)
-├── deploy-example-workload.sh                 # Example model, governance policies, RBAC, LlamaStack playground
+├── deploy-example-workload.sh                 # Example model, MaaS governance (ModelRef/Subscription/AuthPolicy), LlamaStack playground
 ├── teardown-maas.sh                           # Removes everything the above create
 ├── fix-lsd-genai-playground.sh                # Repairs a dashboard-created LlamaStackDistribution's vLLM TLS scheme (see LSD-WORKAROUND.md)
 ├── README.md                                  # This file
@@ -476,7 +480,7 @@ curl -sk -H "Authorization: Bearer ${API_KEY}" \
 - DSC `kserve.modelsAsService` reverted to `Removed`
 - DSC `llamastackoperator` reverted to `Removed` — **conditionally**: since `llamastackoperator` is a cluster-scoped DSC component that may back LlamaStack workloads outside MaaS, the script first deletes the MaaS `LlamaStackDistribution` and then checks `oc get llamastackdistribution -A` cluster-wide. It only reverts the operator to `Removed` if none remain; otherwise it logs a warning and leaves it `Managed`.
 - Gateway `maas-default-gateway`, its external `Route`, and its ConfigMap, all in `openshift-ingress`
-- Authorino TLS patch reverted; `Certificate` and `ClusterIssuer` deleted
+- Authorino TLS patch reverted; `serving-cert-secret-name` annotation removed from the Authorino Service; Secret `authorino-server-cert` deleted (plus any leftover cert-manager `Certificate`/`ClusterIssuer` from older versions of this script)
 - PostgreSQL (`maas-db` namespace + `maas-db-config` Secret)
 
 With `--full`, the cert-manager and RHCL/Kuadrant operators (Subscriptions, CSVs, OperatorGroups, namespaces) are uninstalled as well.
