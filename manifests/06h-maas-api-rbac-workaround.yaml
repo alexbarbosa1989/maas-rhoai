@@ -1,0 +1,55 @@
+# Workaround for a version-skew bug: maas-api's Deployment (created by maas-controller's
+# bundled kustomize overlay) uses the mutable tag quay.io/opendatahub/maas-api:latest with
+# imagePullPolicy: Always, while maas-controller itself — the component that generates
+# maas-api's RBAC — is pinned to a fixed Red Hat digest. When upstream :latest moves ahead
+# (e.g. adding new informers/watches) before the pinned maas-controller's RBAC template
+# catches up, maas-api crash-loops forbidden to list/watch resources it now needs.
+# Confirmed missing on RHOAI 3.4.2 (SNO 4.21, 2026-07-27): maasauthpolicies (namespaced, fatal —
+# blocks ModelsAsServiceReady) and apiservers.config.openshift.io (cluster-scoped, non-fatal —
+# maas-api falls back to a default Intermediate TLS profile without it).
+# Remove this manifest once maas-controller's RBAC template includes these natively upstream.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: maas-api-authpolicies-workaround
+  namespace: models-as-a-service
+rules:
+  - apiGroups: ["maas.opendatahub.io"]
+    resources: ["maasauthpolicies"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: maas-api-authpolicies-workaround
+  namespace: models-as-a-service
+subjects:
+  - kind: ServiceAccount
+    name: maas-api
+    namespace: redhat-ods-applications
+roleRef:
+  kind: Role
+  name: maas-api-authpolicies-workaround
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: maas-api-apiservers-workaround
+rules:
+  - apiGroups: ["config.openshift.io"]
+    resources: ["apiservers"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: maas-api-apiservers-workaround
+subjects:
+  - kind: ServiceAccount
+    name: maas-api
+    namespace: redhat-ods-applications
+roleRef:
+  kind: ClusterRole
+  name: maas-api-apiservers-workaround
+  apiGroup: rbac.authorization.k8s.io

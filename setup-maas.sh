@@ -358,6 +358,23 @@ configure_monitoring() {
   log_ok "User Workload Monitoring enabled."
 }
 
+# Works around a maas-api/maas-controller version-skew bug (see 06h-maas-api-rbac-workaround.yaml
+# for the full explanation). No-ops if the models-as-a-service namespace doesn't exist yet.
+# Restarts maas-api only if it isn't currently Running, so a healthy pod is left undisturbed.
+apply_maas_api_rbac_workaround() {
+  resource_exists namespace models-as-a-service || return 0
+  apply_manifest "${MANIFESTS_DIR}/06h-maas-api-rbac-workaround.yaml"
+  if resource_exists deployment maas-api "$RHOAI_APP_NS"; then
+    local available
+    available=$(oc get deployment maas-api -n "$RHOAI_APP_NS" \
+      -o jsonpath='{.status.availableReplicas}' 2>/dev/null)
+    if [[ "${available:-0}" -lt 1 ]]; then
+      log_info "maas-api not currently available — restarting to pick up the RBAC workaround…"
+      oc rollout restart deployment/maas-api -n "$RHOAI_APP_NS" &>/dev/null || true
+    fi
+  fi
+}
+
 enable_maas_in_dsc() {
   log_step "Step 8: Enabling MaaS (modelsAsService) in the DataScienceCluster"
 
@@ -367,6 +384,7 @@ enable_maas_in_dsc() {
 
   if [[ "$current_state" == "Managed" ]]; then
     log_warn "modelsAsService is already Managed — skipping patch."
+    apply_maas_api_rbac_workaround
     return 0
   fi
 
@@ -378,6 +396,7 @@ enable_maas_in_dsc() {
   log_info "Waiting for DataScienceCluster to reconcile…"
   local deadline=$(( $(date +%s) + OPERATOR_WAIT_TIMEOUT ))
   local dashboard_fix_applied=false
+  local maas_api_rbac_patch_applied=false
   while true; do
     local ready
     ready=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
@@ -385,6 +404,15 @@ enable_maas_in_dsc() {
     if [[ "$ready" == "True" ]]; then
       log_ok "DataScienceCluster '${DSC_NAME}' is Ready."
       break
+    fi
+
+    # See apply_maas_api_rbac_workaround (defined above) for why this is needed: without
+    # it, maas-api can crash-loop forbidden to watch maasauthpolicies, blocking
+    # ModelsAsServiceReady (and thus DSC Ready) indefinitely. No-ops until the
+    # models-as-a-service namespace exists, so keep retrying each loop iteration.
+    if [[ "$maas_api_rbac_patch_applied" == "false" ]] && resource_exists namespace models-as-a-service; then
+      apply_maas_api_rbac_workaround
+      maas_api_rbac_patch_applied=true
     fi
 
     # Detect Dashboard rolling-update deadlock: happens on resource-constrained nodes where

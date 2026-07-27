@@ -53,6 +53,8 @@ Without --full the following are removed:
     from older versions of this script)
   - MaaSSubscription 'llama-3-8b-free' and MaaSAuthPolicy 'llama-3-8b-access'
     in models-as-a-service (the namespace itself is left in place — it's owned by RHOAI)
+  - maas-api RBAC workaround (Role/RoleBinding/ClusterRole/ClusterRoleBinding) for the
+    maas-api/maas-controller image version-skew bug
   - Namespace maas-models
   - DSC reverted (modelsAsService: Removed)
   - DSC llamastackoperator reverted (Removed) — only if no LlamaStackDistribution
@@ -118,6 +120,15 @@ delete_model_workloads() {
   sleep 15
   oc delete namespace "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
   log_ok "Namespace '${MAAS_MODEL_NS}' deleted."
+}
+
+delete_maas_api_rbac_workaround() {
+  log_step "Removing maas-api RBAC workaround (version-skew fix)"
+  oc delete role maas-api-authpolicies-workaround -n models-as-a-service --ignore-not-found 2>/dev/null || true
+  oc delete rolebinding maas-api-authpolicies-workaround -n models-as-a-service --ignore-not-found 2>/dev/null || true
+  oc delete clusterrole maas-api-apiservers-workaround --ignore-not-found 2>/dev/null || true
+  oc delete clusterrolebinding maas-api-apiservers-workaround --ignore-not-found 2>/dev/null || true
+  log_ok "maas-api RBAC workaround resources removed."
 }
 
 revert_dsc() {
@@ -223,6 +234,7 @@ main() {
   confirm
 
   delete_model_workloads   # delete workloads before reverting DSC so controller can clean up
+  delete_maas_api_rbac_workaround
   revert_dsc
   revert_llamastack_operator
   delete_maas_gateway

@@ -51,6 +51,7 @@ export DSC_NAME=default-dsc
 | All `LLMInferenceService` resources | `maas-models` namespace |
 | All `MaaSModelRef` resources | `maas-models` namespace |
 | `MaaSSubscription` `llama-3-8b-free` and `MaaSAuthPolicy` `llama-3-8b-access` | `models-as-a-service` namespace (namespace itself is not deleted) |
+| `maas-api` RBAC workaround (`Role`/`RoleBinding` `maas-api-authpolicies-workaround`, `ClusterRole`/`ClusterRoleBinding` `maas-api-apiservers-workaround`) for the `maas-api`/`maas-controller` image version-skew bug | `models-as-a-service` namespace / cluster-scoped |
 | Any leftover `AuthPolicy`/`RateLimitPolicy`/`TokenRateLimitPolicy`/`RoleBinding` from older script versions | `maas-models` namespace |
 | Namespace `maas-models` | cluster-scoped |
 | DSC `modelsAsService` reverted to `Removed` | `redhat-ods-operator` namespace |
@@ -90,15 +91,16 @@ export DSC_NAME=default-dsc
 
 Steps run in reverse dependency order to avoid controller races:
 
-1. **Delete model workloads** — `LlamaStackDistribution`, `LLMInferenceService`, and `MaaSModelRef` are deleted first so their controllers can clean up dependent resources (HTTPRoutes, certs) before the namespace is forcibly removed; the `MaaSSubscription`/`MaaSAuthPolicy` in `models-as-a-service` are deleted by name at the same step (different namespace, not touched by the `maas-models` namespace deletion). The script waits 15 s between workload deletion and namespace deletion. Deleting the MaaS `LlamaStackDistribution` here first is what makes step 2b's cluster-wide check accurate.
-2. **Revert DSC** — after workloads are gone so the `maas-controller` does not race to recreate them.
-   - **2a.** `modelsAsService` → `Removed` unconditionally.
-   - **2b.** `llamastackoperator` → `Removed` only if `oc get llamastackdistribution -A` now returns none; otherwise left `Managed` with a warning, since this DSC component is cluster-scoped and may be used outside MaaS.
-3. **Delete MaaS gateway** — the external Route and the Gateway itself, no longer needed once the DSC is reverted.
-4. **Revert Authorino TLS** — patches the Authorino CR back to `tls.enabled: false`, then deletes the certificate and ClusterIssuer.
-5. **Delete PostgreSQL** — `maas-db` namespace and the `maas-db-config` Secret in `redhat-ods-applications`.
-6. *(--full)* **Delete cert-manager** — after all cert-manager-managed resources (Certificates, ClusterIssuer) are already gone.
-7. *(--full)* **Delete RHCL/Kuadrant** — after the Kuadrant CR and all policies are gone.
+1. **Delete model workloads** — `LlamaStackDistribution`, `LLMInferenceService`, and `MaaSModelRef` are deleted first so their controllers can clean up dependent resources (HTTPRoutes, certs) before the namespace is forcibly removed; the `MaaSSubscription`/`MaaSAuthPolicy` in `models-as-a-service` are deleted by name at the same step (different namespace, not touched by the `maas-models` namespace deletion). The script waits 15 s between workload deletion and namespace deletion. Deleting the MaaS `LlamaStackDistribution` here first is what makes step 3b's cluster-wide check accurate.
+2. **Remove the `maas-api` RBAC workaround** — the `Role`/`RoleBinding`/`ClusterRole`/`ClusterRoleBinding` `setup-maas.sh` adds to work around the `maas-api`/`maas-controller` image version-skew bug (see `README.md` Troubleshooting).
+3. **Revert DSC** — after workloads are gone so the `maas-controller` does not race to recreate them.
+   - **3a.** `modelsAsService` → `Removed` unconditionally.
+   - **3b.** `llamastackoperator` → `Removed` only if `oc get llamastackdistribution -A` now returns none; otherwise left `Managed` with a warning, since this DSC component is cluster-scoped and may be used outside MaaS.
+4. **Delete MaaS gateway** — the external Route and the Gateway itself, no longer needed once the DSC is reverted.
+5. **Revert Authorino TLS** — patches the Authorino CR back to `tls.enabled: false`, then deletes the certificate and ClusterIssuer.
+6. **Delete PostgreSQL** — `maas-db` namespace and the `maas-db-config` Secret in `redhat-ods-applications`.
+7. *(--full)* **Delete cert-manager** — after all cert-manager-managed resources (Certificates, ClusterIssuer) are already gone.
+8. *(--full)* **Delete RHCL/Kuadrant** — after the Kuadrant CR and all policies are gone.
 
 ---
 

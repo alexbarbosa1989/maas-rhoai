@@ -228,6 +228,12 @@ spec:
 
 This activates the MaaS platform layer. The RHOAI operator then deploys `maas-controller` and `maas-api`, and creates the `Tenant/default-tenant` CR in `models-as-a-service`.
 
+While waiting for the DSC to become Ready, this step also applies
+`manifests/06h-maas-api-rbac-workaround.yaml` as soon as `models-as-a-service` exists —
+see [maas-api in CrashLoopBackOff](#maas-api-in-crashloopbackoff) in Troubleshooting for why
+this is necessary (a version-skew bug between `maas-api`'s mutable `:latest` image tag and
+the pinned `maas-controller` that generates its RBAC).
+
 ### Step 9 — Enable GenAI Studio
 Patches `OdhDashboardConfig/odh-dashboard-config` to set `spec.dashboardConfig.genAiStudio: true`, which surfaces the GenAI Studio section (including the GenAI Playground) in the RHOAI dashboard.
 
@@ -296,6 +302,7 @@ maas-rhoai/
     ├── 06d-maas-postgresql.yaml               # PostgreSQL for maas-api + DB config Secret
     ├── 06f-user-workload-monitoring.yaml      # Enables OpenShift User Workload Monitoring
     ├── 06g-maas-gateway-route.yaml            # External Route exposing the gateway (host templated)
+    ├── 06h-maas-api-rbac-workaround.yaml      # Workaround for maas-api/maas-controller image version-skew (see Troubleshooting)
     ├── 07-model-namespace.yaml                # maas-models namespace
     ├── 08-example-llminferenceservice.yaml    # Example LLMInferenceService (llama-3.1-8B FP8, OCI)
     ├── 09-example-maas-modelref.yaml          # MaaSModelRef publishing the model to MaaS
@@ -503,14 +510,40 @@ oc get gateway maas-default-gateway -n openshift-ingress
 ```
 
 ### maas-api in CrashLoopBackOff
-Most likely PostgreSQL is not yet reachable. Check:
+Check the logs first to tell which of the two known causes it is:
 ```bash
 oc get pods -n maas-db
 oc logs -n redhat-ods-applications -l app.kubernetes.io/name=maas-api --tail=50
 ```
-If PostgreSQL was recently fixed, delete the pod to skip exponential backoff:
+
+**Cause 1 — PostgreSQL not yet reachable.** If the log shows connection errors to
+`maas-db`, PostgreSQL likely isn't ready yet. Once it's up, delete the pod to skip
+exponential backoff:
 ```bash
 oc delete pod -n redhat-ods-applications -l app.kubernetes.io/name=maas-api
+```
+
+**Cause 2 — RBAC forbidden error (`maasauthpolicies is forbidden ... cannot list
+resource`).** This is a version-skew bug, not a config mistake: `maas-api`'s Deployment
+(created by `maas-controller`'s bundled kustomize overlay) uses the mutable tag
+`quay.io/opendatahub/maas-api:latest` with `imagePullPolicy: Always`, while
+`maas-controller` — the component that generates `maas-api`'s RBAC — is pinned to a fixed
+Red Hat digest. Whenever the pod is recreated (e.g. after a teardown/setup cycle), it
+re-pulls whatever `:latest` currently is upstream; if that build is ahead of what the
+pinned `maas-controller` grants (e.g. a new watch on `MaaSAuthPolicy`, or on the
+cluster-scoped `apiservers.config.openshift.io` for the TLS profile — the latter is
+non-fatal and just falls back to a default TLS profile), `maas-api` crash-loops instead
+of starting, which blocks `ModelsAsServiceReady` and thus overall DSC `Ready`.
+
+`setup-maas.sh` now applies a defensive workaround automatically
+(`manifests/06h-maas-api-rbac-workaround.yaml`, granting `maas-api`'s ServiceAccount the
+missing permissions directly) as soon as the `models-as-a-service` namespace exists during
+Step 8, and force-restarts `maas-api` if it isn't yet available so it doesn't have to wait
+out crash-loop backoff. If you still see this after an up-to-date `setup-maas.sh` run,
+re-apply it manually and restart:
+```bash
+oc apply -f manifests/06h-maas-api-rbac-workaround.yaml
+oc rollout restart deployment/maas-api -n redhat-ods-applications
 ```
 
 ### Authorino TLS errors / MaaS auth not working
