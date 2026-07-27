@@ -318,13 +318,25 @@ maas-rhoai/
 After the platform is configured, deploying a new LLM is a three-step process: create the
 `LLMInferenceService`, publish it to MaaS with the three MaaS-native CRDs, then call it.
 
+The example below uses the exact same names/values as the `llama-3-8b` model that
+`deploy-example-workload.sh` deploys (see `manifests/08-example-llminferenceservice.yaml`
+through `11-example-maas-auth-policy.yaml`) — so every command here is copy-paste-safe
+against a cluster that already ran that script, and doubles as a working reference you can
+diff your own model's names against. **To deploy a genuinely different model**, replace
+`llama-3-8b` (and `llama-3-8b-free` / `llama-3-8b-access`) throughout with your own model's
+name — just make sure the same name is used consistently across all four resources below and
+in the API calls, since a mismatch (e.g. minting a key against a subscription name that
+doesn't exist) fails with an easy-to-miss error — see
+[Minting an API key returns no `.key` field](#minting-an-api-key-returns-no-key-field-jq--r-key-prints-null)
+in Troubleshooting.
+
 ### 1. Create the LLMInferenceService
 
 ```yaml
 apiVersion: serving.kserve.io/v1alpha2
 kind: LLMInferenceService
 metadata:
-  name: my-llm
+  name: llama-3-8b
   namespace: maas-models
   annotations:
     opendatahub.io/hardware-profile-name: local-gpu
@@ -335,7 +347,7 @@ metadata:
     opendatahub.io/genai-asset: "true"
 spec:
   model:
-    name: my-llm
+    name: llama-3-8b
     uri: oci://registry.redhat.io/rhelai1/modelcar-llama-3-1-8b-instruct-fp8-dynamic:1.5
   replicas: 1
   router:
@@ -353,11 +365,11 @@ spec:
         value: --max-model-len=16000 --enable-auto-tool-choice --tool-call-parser=llama3_json
       resources:
         requests:
-          cpu: "2"
+          cpu: "1"
           memory: 4Gi
           nvidia.com/gpu: "1"
         limits:
-          cpu: "4"
+          cpu: "1"
           memory: 8Gi
           nvidia.com/gpu: "1"
 ```
@@ -369,29 +381,30 @@ spec:
 > - `VLLM_ADDITIONAL_ARGS` controls vLLM startup flags; adjust `--max-model-len` for your GPU VRAM
 
 ```bash
-oc apply -f my-llm.yaml
+oc apply -f llama-3-8b.yaml
 # Monitor status
-oc get llminferenceservice my-llm -n maas-models -w
+oc get llminferenceservice llama-3-8b -n maas-models -w
 # Check the HTTPRoute created by the controller
 oc get httproute -n maas-models
 ```
 
 ### 2. Publish it to MaaS
 
-Three MaaS-native custom resources, applied in order (see §1.17.2 of the official docs):
+Three MaaS-native custom resources, applied in order (see §1.17.2 of the official docs) —
+matching `manifests/09-example-maas-modelref.yaml` through `11-example-maas-auth-policy.yaml`:
 
 ```bash
-# MaaSModelRef — publishes the model (replace 'my-llm' throughout)
+# MaaSModelRef — publishes the model
 oc apply -f - <<EOF
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: MaaSModelRef
 metadata:
-  name: my-llm
+  name: llama-3-8b
   namespace: maas-models
 spec:
   modelRef:
     kind: LLMInferenceService
-    name: my-llm
+    name: llama-3-8b
 EOF
 
 # MaaSSubscription — token quota and eligible groups/users (must live in models-as-a-service)
@@ -399,14 +412,14 @@ oc apply -f - <<EOF
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: MaaSSubscription
 metadata:
-  name: my-llm-free
+  name: llama-3-8b-free
   namespace: models-as-a-service
 spec:
   owner:
     groups:
-      - name: data-scientists
+      - name: system:authenticated
   modelRefs:
-    - name: my-llm
+    - name: llama-3-8b
       namespace: maas-models
       tokenRateLimits:
         - limit: 100000
@@ -420,28 +433,31 @@ oc apply -f - <<EOF
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: MaaSAuthPolicy
 metadata:
-  name: my-llm-access
+  name: llama-3-8b-access
   namespace: models-as-a-service
 spec:
   subjects:
     groups:
-      - name: data-scientists
+      - name: system:authenticated
   modelRefs:
-    - name: my-llm
+    - name: llama-3-8b
       namespace: maas-models
 EOF
 ```
 
 Verify:
 ```bash
-oc get maasmodelref my-llm -n maas-models -o jsonpath='{.status.phase}'   # expect: Ready
-oc get maasauthpolicy my-llm-access -n models-as-a-service -o jsonpath='{.status.phase}'   # expect: Active
+oc get maasmodelref llama-3-8b -n maas-models -o jsonpath='{.status.phase}'   # expect: Ready
+oc get maasauthpolicy llama-3-8b-access -n models-as-a-service -o jsonpath='{.status.phase}'   # expect: Active
 ```
 
 ### 3. Call the API
 
 Inference goes through the single MaaS gateway hostname, authenticated with a **MaaS API
-key** (not a raw OpenShift bearer token) — mint one against the management API first:
+key** (not a raw OpenShift bearer token) — mint one against the management API first. The
+`subscription` field below must exactly match an existing `MaaSSubscription` name
+(`oc get maassubscription -A`) — see the Troubleshooting note linked above if this ever
+mints a key that comes back `null`:
 
 ```bash
 APPS_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
@@ -451,7 +467,7 @@ TOKEN=$(oc whoami -t)
 # Mint an API key scoped to your subscription
 API_KEY=$(curl -sk -X POST "${MAAS_URL}/maas-api/v1/api-keys" \
   -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
-  -d '{"name":"my-key","subscription":"my-llm-free","expiresIn":"30d"}' | jq -r .key)
+  -d '{"name":"my-key","subscription":"llama-3-8b-free","expiresIn":"30d"}' | jq -r .key)
 
 # List models available to you
 curl -sk -H "Authorization: Bearer ${API_KEY}" "${MAAS_URL}/maas-api/v1/models" | jq
@@ -460,10 +476,10 @@ curl -sk -H "Authorization: Bearer ${API_KEY}" "${MAAS_URL}/maas-api/v1/models" 
 # (that's what the official docs describe, but it isn't wired up as an HTTPRoute on
 # every RHOAI 3.4.x build — check `oc get httproute -n <namespace>` if this 404s for you)
 curl -sk -H "Authorization: Bearer ${API_KEY}" \
-  "${MAAS_URL}/maas-models/my-llm/v1/chat/completions" \
+  "${MAAS_URL}/maas-models/llama-3-8b/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "my-llm",
+    "model": "llama-3-8b",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
