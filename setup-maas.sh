@@ -521,9 +521,29 @@ verify_maas_components() {
   # llmisvc-controller-manager — reconciles LLMInferenceService resources
   wait_for_pods "$RHOAI_APP_NS" "control-plane=llmisvc-controller-manager" "$POD_WAIT_TIMEOUT"
 
-  # maas-api — MaaS platform API (needs PostgreSQL to be up first)
+  # Guaranteed application point for the maas-api RBAC workaround: Step 8's DSC-Ready
+  # wait loop applies it opportunistically, but that loop can exit as soon as the DSC's
+  # top-level Ready condition goes True — which can happen before maas-api's own
+  # ModelsAsServiceReady-relevant crash-loop even surfaces (confirmed live: DSC Ready
+  # flipped True on the very first check, before models-as-a-service/maas-api had
+  # stabilized). By this point in Step 11 the namespace reliably exists, so apply it
+  # unconditionally here as the real backstop.
+  apply_maas_api_rbac_workaround
+
+  # maas-api — MaaS platform API (needs PostgreSQL to be up first). wait_for_pods only
+  # checks pod phase=Running, which a crash-looping pod can transiently satisfy between
+  # restarts — so also confirm the Deployment's rollout actually completes. Using
+  # `oc rollout status` (not a raw `oc wait` on pods) both prints its own progress lines
+  # (so this doesn't look hung for minutes) and avoids getting stuck on an old,
+  # about-to-be-replaced pod that still matches the label selector during a restart.
   wait_for_pods "$RHOAI_APP_NS" "app.kubernetes.io/name=maas-api" "$POD_WAIT_TIMEOUT" \
     || { log_error "maas-api pod not Running. Check PostgreSQL connectivity."; exit 1; }
+  if ! oc rollout status deployment/maas-api -n "$RHOAI_APP_NS" --timeout="${POD_WAIT_TIMEOUT}s"; then
+    log_warn "maas-api not yet available — restarting once to pick up the RBAC workaround…"
+    oc rollout restart deployment/maas-api -n "$RHOAI_APP_NS"
+    oc rollout status deployment/maas-api -n "$RHOAI_APP_NS" --timeout="${POD_WAIT_TIMEOUT}s" \
+      || { log_error "maas-api still not available after restart. Check its logs for a forbidden/RBAC error."; exit 1; }
+  fi
 
   # maas-controller — manages Tenant, MaaSAuthPolicy, etc.
   wait_for_pods "$RHOAI_APP_NS" "control-plane=maas-controller" "$POD_WAIT_TIMEOUT"
