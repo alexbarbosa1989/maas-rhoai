@@ -608,6 +608,28 @@ oc get authpolicy -n openshift-ingress
 oc logs -n kuadrant-system -l control-plane=controller-manager --tail=50
 ```
 
+### Minting an API key returns no `.key` field (`jq -r .key` prints `null`)
+The `subscription` field in the `POST /maas-api/v1/api-keys` request body must exactly
+match an existing `MaaSSubscription` name — check with:
+```bash
+oc get maassubscription -A
+```
+For the example workload that's `llama-3-8b-free`, **not** a placeholder like `my-llm-free`
+(easy to copy verbatim from the "Deploying your own model" section below, which uses generic
+`my-llm` names for a hypothetical custom model). An unresolvable subscription returns a `400`
+with no `.key` field:
+```json
+{"code":"invalid_subscription","error":"Unable to resolve a subscription for this API key"}
+```
+`jq -r .key` on that response prints the literal string `null` instead of erroring, which
+easily reads as "nothing happened." Print the raw response first if a mint call ever looks
+like it silently failed:
+```bash
+curl -sk -X POST "${MAAS_URL}/maas-api/v1/api-keys" \
+  -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
+  -d '{"name":"my-key","subscription":"<subscription-name>","expiresIn":"30d"}'
+```
+
 ### External API calls fail: "Application is not available" (503) or connection refused
 This means the request never reached the MaaS gateway at all — either DNS for
 `maas.<apps-domain>` doesn't resolve to your cluster, or the Route isn't admitted:
