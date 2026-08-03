@@ -190,6 +190,23 @@ flags) is correctly configured — verified via `oc get` against each resource d
 a CRC-only gap; a real OpenShift cluster with platform monitoring enabled (the default) is not
 affected.
 
+**Fix for CRC**: enable the platform monitoring stack via the CRC config flag, then restart:
+```bash
+crc config set enable-cluster-monitoring true
+crc stop
+crc start
+```
+Verified live: this brings up `cluster-monitoring-operator`, `prometheus-k8s`, `thanos-querier`,
+and (with `enableUserWorkload: true` already set by `../setup-maas.sh`) `prometheus-user-workload`
+in `openshift-user-workload-monitoring` — confirm with:
+```bash
+oc get clusteroperator monitoring
+oc get pods -n openshift-user-workload-monitoring
+```
+Once both are healthy, re-run `./setup.sh` (or just wait — the `PodMonitor` this script already
+created will start getting scraped without re-applying anything) and retry the verification
+steps above.
+
 ### Cardinality / Prometheus growth after enabling `captureUser`
 Revert with:
 ```bash
