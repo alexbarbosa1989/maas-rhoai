@@ -163,11 +163,24 @@ oc get crd perses.perses.dev
   stack backs the "Cluster"/"Models" tabs). It reads from a separate PersesDatasource,
   `kuadrant-prometheus-datasource` (namespace `redhat-ods-applications`, auto-created by
   `maas-api`), which targets `https://thanos-querier.openshift-monitoring.svc:9092?namespace=kuadrant-system`
-  — the **platform User Workload Monitoring** Thanos Querier, not the local MonitoringStack
-  Prometheus. Confirm that datasource is `Available`:
+  — the platform Thanos Querier, which federates both platform Prometheus (`prometheus-k8s`)
+  and User Workload Monitoring (`prometheus-user-workload`). Confirm that datasource is
+  `Available`:
   ```bash
   oc get persesdatasource kuadrant-prometheus-datasource -n redhat-ods-applications -o jsonpath='{.status.conditions}'
   ```
+- **Which Prometheus actually scrapes `kuadrant-limitador-monitor` depends on a namespace
+  label, not UWM's `enableUserWorkload` setting.** `kuadrant-system` carries
+  `openshift.io/cluster-monitoring=true` (set by RHCL, not this module) — User Workload
+  Monitoring's Prometheus explicitly *excludes* namespaces with that label
+  (`podMonitorNamespaceSelector: NotIn ["true"]`), while the *platform* Prometheus
+  (`prometheus-k8s`) explicitly *includes* them. So the `PodMonitor` this script's
+  `enable_kuadrant_observability` step triggers is scraped by `prometheus-k8s`, not
+  `prometheus-user-workload` — verified live via `prometheus-k8s`'s `/api/v1/targets`
+  (`podMonitor/kuadrant-system/kuadrant-limitador-monitor/0`, status `up`). Functionally this
+  doesn't matter for the dashboard (Thanos Querier federates both), but if you're debugging by
+  querying a specific Prometheus instance directly, query `prometheus-k8s`
+  (`openshift-monitoring`), not `prometheus-user-workload`.
 - Query `authorized_calls` the same way the dashboard does, to confirm Prometheus is scraping
   independent of the dashboard UI:
   ```bash
@@ -206,6 +219,25 @@ oc get pods -n openshift-user-workload-monitoring
 Once both are healthy, re-run `./setup.sh` (or just wait — the `PodMonitor` this script already
 created will start getting scraped without re-applying anything) and retry the verification
 steps above.
+
+#### Scraping confirmed working, but still no data: check Limitador's own `/metrics`
+Even after fixing the CRC monitoring gap above, we found a **separate, deeper issue** during
+full end-to-end verification (real traffic through a `TokenRateLimitPolicy`-`Enforced` route):
+Limitador itself was not emitting `authorized_calls`/`authorized_hits`/`limited_calls` at all —
+only the two static `limitador_up`/`datastore_partitioned` gauges, regardless of how many
+successful requests were sent. This is **not** something `maas-observability/setup.sh` controls
+(it only sets `Kuadrant.spec.observability.enable: true`, which correctly creates the
+`PodMonitor` — confirmed scraped and `up` on `prometheus-k8s`). If the Usage tab still shows no
+data after confirming scraping works, check Limitador's own metrics directly before assuming
+this module is at fault:
+```bash
+LIM_POD=$(oc get pod -n kuadrant-system -l app=limitador -o jsonpath='{.items[0].metadata.name}')
+oc exec -n kuadrant-system "$LIM_POD" -- curl -s http://localhost:8080/metrics
+```
+If this shows only `limitador_up`/`datastore_partitioned` with no `authorized_*`/`limited_*`
+series even after sending real traffic through an `Enforced` `TokenRateLimitPolicy`/
+`RateLimitPolicy`, this is a Kuadrant/Limitador-level gap (observed on RHCL 1.4.2 / Limitador
+v2.4.2) — raise it with Red Hat support rather than treating it as a bug in this module.
 
 ### Cardinality / Prometheus growth after enabling `captureUser`
 Revert with:

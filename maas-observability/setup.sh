@@ -386,8 +386,8 @@ print_summary() {
   echo -e "       --type=merge -p '{\"spec\":{\"telemetry\":{\"metrics\":{\"captureUser\":true}}}}'"
   echo
   echo -e "  ${BOLD}Quick metric check${NC} — the dashboard's Usage tab reads from the platform"
-  echo -e "  User Workload Monitoring Thanos Querier (kuadrant-prometheus-datasource), not the"
-  echo -e "  Tempo/OTel/COO stack this script installs. Query it the same way the dashboard does:"
+  echo -e "  Thanos Querier (kuadrant-prometheus-datasource), not the Tempo/OTel/COO stack this"
+  echo -e "  script installs. Query it the same way the dashboard does:"
   echo -e "     TOKEN=\$(oc whoami -t)"
   echo -e "     curl -sk -H \"Authorization: Bearer \${TOKEN}\" \\"
   echo -e "       'https://thanos-querier.openshift-monitoring.svc:9092/api/v1/query?namespace=${KUADRANT_NS}&query=authorized_calls'"
