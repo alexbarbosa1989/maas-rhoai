@@ -273,14 +273,15 @@ enable_maas_telemetry() {
   fi
 
   log_info "Current telemetry.enabled: '${current:-unset}' → true"
+  # Need to disable captureOrganization, and group due to <https://redhat.atlassian.net/browse/CONNLINK-1300>
   oc patch tenants.maas.opendatahub.io "$MAAS_TENANT_NAME" -n "$MAAS_TENANT_NS" \
     --type=merge -p '{
       "spec": {
         "telemetry": {
           "enabled": true,
           "metrics": {
-            "captureOrganization": true,
-            "captureUser": false,
+            "captureOrganization": false,
+            "captureUser": true,
             "captureGroup": false,
             "captureModelUsage": true
           }
