@@ -61,7 +61,9 @@ Options:
 
 Always removed:
   - Gateway telemetry: TelemetryPolicy 'maas-telemetry' and Istio Telemetry
-    'latency-per-subscription' (openshift-ingress)
+    'latency-per-subscription' (openshift-ingress) — auto-created by maas-controller
+    once Tenant telemetry is enabled, not by setup.sh; deleted here as a safety net,
+    after Tenant telemetry is already disabled so maas-controller doesn't recreate them
   - The PersesDashboard/PersesDatasource that maas-api creates directly when Tenant
     telemetry is enabled ('dashboard-3-maas-usage-admin', 'kuadrant-prometheus-datasource'
     in redhat-ods-applications) — these have no ownerReferences, so nothing else garbage
@@ -116,8 +118,15 @@ confirm() {
 
 # ─── Teardown steps ───────────────────────────────────────────────────────────
 
+# maas-controller (redhat-ods-applications) auto-creates and owns both of these via
+# Server-Side Apply the moment Tenant.spec.telemetry.enabled is true — confirmed live:
+# deleting either one while telemetry is still enabled gets it recreated within ~45s.
+# revert_maas_telemetry() must run BEFORE this function so Tenant telemetry is already
+# disabled by the time we delete — otherwise maas-controller may recreate what we just
+# removed. Kept as an explicit step (not assumed to be automatic) since it's unconfirmed
+# whether maas-controller does symmetric cleanup on its own when telemetry is disabled.
 delete_gateway_telemetry() {
-  log_step "Deleting gateway telemetry"
+  log_step "Deleting gateway telemetry (maas-controller-owned)"
   oc delete telemetrypolicy maas-telemetry -n "$GATEWAY_NS" --ignore-not-found 2>/dev/null || true
   oc delete telemetry.telemetry.istio.io latency-per-subscription -n "$GATEWAY_NS" --ignore-not-found 2>/dev/null || true
   log_ok "Gateway telemetry CRs deleted."
@@ -256,10 +265,10 @@ main() {
 
   confirm
 
-  delete_gateway_telemetry
   delete_orphaned_perses_resources
   revert_observability_dashboard
   revert_maas_telemetry
+  delete_gateway_telemetry
   revert_kuadrant_observability
   revert_dsci_monitoring
 

@@ -288,7 +288,7 @@ enable_maas_telemetry() {
         }
       }
     }'
-  log_ok "Tenant telemetry enabled (captureUser=false by default — see README for how to change)."
+  log_ok "Tenant telemetry enabled (captureUser=true by default — see README for how to change)."
 }
 
 enable_observability_dashboard() {
@@ -315,16 +315,8 @@ enable_observability_dashboard() {
   log_ok "observabilityDashboard enabled in OdhDashboardConfig."
 }
 
-apply_gateway_telemetry() {
-  log_step "Step 9: Applying gateway telemetry (Kuadrant TelemetryPolicy + Istio Telemetry)"
-
-  apply_manifest "${MANIFESTS_DIR}/telemetry/gateway-telemetry-policy.yaml"
-  apply_manifest "${MANIFESTS_DIR}/telemetry/istio-gateway-telemetry.yaml"
-  log_ok "Gateway telemetry applied."
-}
-
 verify_observability_components() {
-  log_step "Step 10: Verifying observability components"
+  log_step "Step 9: Verifying observability components"
 
   local tempo_csv otel_csv coo_csv
   tempo_csv=$(oc get csv -n "$TEMPO_NS" 2>/dev/null | awk '/tempo-operator/{print $NF}' | head -1)
@@ -338,16 +330,50 @@ verify_observability_components() {
   [[ "$coo_csv" == "Succeeded" ]] && log_ok "COO: Succeeded" \
     || log_warn "COO CSV: ${coo_csv:-not found}"
 
+  # maas-controller auto-creates both of these itself once Tenant.spec.telemetry.enabled
+  # is true (Step 7) — this script never applies them directly. Confirmed live: deleting
+  # either one causes maas-controller to recreate it within ~45s via Server-Side Apply, so
+  # poll briefly rather than checking only once immediately after Step 7.
+  local telemetry_wait_deadline=$(( $(date +%s) + 60 ))
+  until resource_exists telemetrypolicies.extensions.kuadrant.io maas-telemetry "$GATEWAY_NS" \
+      || (( $(date +%s) > telemetry_wait_deadline )); do
+    sleep 5
+  done
   if resource_exists telemetrypolicies.extensions.kuadrant.io maas-telemetry "$GATEWAY_NS"; then
-    log_ok "TelemetryPolicy 'maas-telemetry' exists in '${GATEWAY_NS}'."
+    log_ok "TelemetryPolicy 'maas-telemetry' exists in '${GATEWAY_NS}' (auto-created by maas-controller)."
   else
-    log_warn "TelemetryPolicy 'maas-telemetry' not found in '${GATEWAY_NS}'."
+    log_warn "TelemetryPolicy 'maas-telemetry' not found in '${GATEWAY_NS}' after 60s — maas-controller should create this automatically once Tenant telemetry is enabled."
   fi
 
   if resource_exists telemetry.telemetry.istio.io latency-per-subscription "$GATEWAY_NS"; then
-    log_ok "Istio Telemetry 'latency-per-subscription' exists in '${GATEWAY_NS}'."
+    log_ok "Istio Telemetry 'latency-per-subscription' exists in '${GATEWAY_NS}' (auto-created by maas-controller)."
   else
     log_warn "Istio Telemetry 'latency-per-subscription' not found in '${GATEWAY_NS}'."
+  fi
+
+  # Known upstream gap (opendatahub-io/models-as-a-service maas-controller): the
+  # TelemetryPolicy it generates references auth.identity.subscription_info.organizationId/
+  # costCenter unconditionally. Those are optional MaaSSubscription.spec.tokenMetadata
+  # fields — if unset, the CEL evaluation error silently drops the ratelimit-report call to
+  # Limitador for that subscription (request still succeeds; usage is just never counted).
+  # See ../KCS-MAAS-TELEMETRY-COSTCENTER-CEL.md for the full root cause and workaround.
+  local subs_missing_metadata
+  subs_missing_metadata=$(oc get maassubscription -A -o json 2>/dev/null \
+    | python3 -c "
+import json,sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for item in data.get('items', []):
+    tm = item.get('spec', {}).get('tokenMetadata')
+    if not tm or not tm.get('organizationId') or not tm.get('costCenter'):
+        print(f\"{item['metadata']['namespace']}/{item['metadata']['name']}\")
+" 2>/dev/null)
+  if [[ -n "$subs_missing_metadata" ]]; then
+    log_warn "MaaSSubscription(s) without tokenMetadata.organizationId/costCenter set (Usage tab will show zero data for these until set):"
+    echo "$subs_missing_metadata" | while read -r s; do log_warn "  - ${s}"; done
+    log_warn "Fix: oc patch maassubscription <name> -n <namespace> --type=merge -p '{\"spec\":{\"tokenMetadata\":{\"organizationId\":\"<org>\",\"costCenter\":\"<cc>\"}}}'"
   fi
 
   local kuadrant_obs tenant_telemetry dashboard_flag
@@ -381,10 +407,19 @@ print_summary() {
   echo -e "  $(oc get route rhods-dashboard -n "$RHOAI_APP_NS" \
     -o jsonpath='https://{.spec.host}' 2>/dev/null || echo 'see: oc get route -n redhat-ods-applications')"
   echo
-  echo -e "  ${BOLD}Per-user metrics are OFF by default${NC} (captureUser=false, to limit Prometheus"
-  echo -e "  cardinality). To enable them:"
+  echo -e "  ${BOLD}Per-user metrics are ON by default${NC} (captureUser=true) — required for the"
+  echo -e "  Usage tab's per-user filtered queries to return data; see"
+  echo -e "  ../KCS-MAAS-WASM-SHIM-CONTEXT-ID-USER-LABEL.md for why. To disable (reduces Prometheus"
+  echo -e "  cardinality, loses per-user breakdown):"
   echo -e "     oc patch tenants.maas.opendatahub.io ${MAAS_TENANT_NAME} -n ${MAAS_TENANT_NS} \\"
-  echo -e "       --type=merge -p '{\"spec\":{\"telemetry\":{\"metrics\":{\"captureUser\":true}}}}'"
+  echo -e "       --type=merge -p '{\"spec\":{\"telemetry\":{\"metrics\":{\"captureUser\":false}}}}'"
+  echo
+  echo -e "  ${RED}${BOLD}Required for the Usage tab to show any data (on RHOAI <= 3.4.2):${NC} every"
+  echo -e "  MaaSSubscription needs spec.tokenMetadata.organizationId/costCenter set (Step 9 above"
+  echo -e "  lists any that don't). Fixed upstream for RHOAI 3.4.4+ (maas-controller PR #1276/#1311)"
+  echo -e "  — see ../KCS-MAAS-TELEMETRY-COSTCENTER-CEL.md for details."
+  echo -e "     oc patch maassubscription <name> -n <namespace> --type=merge \\"
+  echo -e "       -p '{\"spec\":{\"tokenMetadata\":{\"organizationId\":\"<org>\",\"costCenter\":\"<cc>\"}}}'"
   echo
   echo -e "  ${BOLD}Quick metric check${NC} — the dashboard's Usage tab reads from the platform"
   echo -e "  Thanos Querier (kuadrant-prometheus-datasource), not the Tempo/OTel/COO stack this"
@@ -425,8 +460,7 @@ main() {
   enable_kuadrant_observability   # Step 6
   enable_maas_telemetry           # Step 7
   enable_observability_dashboard  # Step 8
-  apply_gateway_telemetry         # Step 9
-  verify_observability_components # Step 10
+  verify_observability_components # Step 9
 
   print_summary
 }

@@ -71,31 +71,37 @@ Patches `Kuadrant/kuadrant` → `spec.observability.enable: true`, which creates
 so Prometheus scrapes token-consumption/rate-limit metrics from Limitador.
 
 ### Step 7 — Enable MaaS gateway telemetry
-Patches `Tenant/default-tenant` → `spec.telemetry.enabled: true`, activating the
-`TelemetryPolicy`/Istio `Telemetry` collection path. `captureUser` is **false by default**
-(privacy/cardinality — a large user base can significantly grow the Prometheus database); see
-[Enabling per-user metrics](#enabling-per-user-metrics) below to turn it on.
+Patches `Tenant/default-tenant` → `spec.telemetry.enabled: true`. `captureUser` is **true by
+default** — required for the Usage tab's per-user filtered queries to return any data at all
+(without it, `maas-controller` never adds a `user` label mapping to `TelemetryPolicy`, so every
+per-user query the dashboard runs comes back empty.
+Set it back to `false` if you'd rather trade that off for lower Prometheus cardinality — see
+[Disabling per-user metrics](#disabling-per-user-metrics) below.
+
+This alone is what activates gateway-side telemetry collection — `maas-controller` (part of
+the RHOAI application, not this script) auto-generates `TelemetryPolicy/maas-telemetry`
+(Kuadrant) and `Telemetry/latency-per-subscription` (Istio) the moment this flag is true. This
+module used to apply its own copies of those two CRs directly; that step was removed because
+`maas-controller` owns and reconciles them regardless (confirmed live: it recreates them within
+~45s of deletion), making a separate apply redundant. 
 
 ### Step 8 — Enable the dashboard tab
 Patches `OdhDashboardConfig/odh-dashboard-config` → `spec.dashboardConfig.observabilityDashboard:
 true`, which surfaces Observe & monitor → Dashboard → **Usage** tab in the RHOAI UI.
 
-### Step 9 — Apply gateway telemetry
-Applies two CRs targeting `maas-default-gateway`:
-- `TelemetryPolicy/maas-telemetry` (Kuadrant) — adds `model`/`user`/`subscription`/
-  `organization_id`/`cost_center` labels to gateway metrics.
-- `Telemetry/latency-per-subscription` (Istio) — tags request-duration metrics with the
-  subscription from the `x-maas-subscription` header.
+### Step 9 — Verify
+Checks all 3 operator CSVs are `Succeeded`, that `maas-controller` has created both telemetry
+CRs (polls up to 60s, since creation is asynchronous), that all 3 CR patches took effect, and
+lists any `MaaSSubscription` missing `spec.tokenMetadata.organizationId`/`costCenter`
 
-### Step 10 — Verify
-Checks all 3 operator CSVs are `Succeeded`, both telemetry CRs exist, and all 3 CR patches
-took effect.
+## Disabling per-user metrics
 
-## Enabling per-user metrics
+`captureUser: true` is the default (see Step 7 above). To turn it back off — trading away
+per-user breakdown in the Usage tab for lower Prometheus cardinality:
 
 ```bash
 oc patch tenants.maas.opendatahub.io default-tenant -n models-as-a-service \
-  --type=merge -p '{"spec":{"telemetry":{"metrics":{"captureUser":true}}}}'
+  --type=merge -p '{"spec":{"telemetry":{"metrics":{"captureUser":false}}}}'
 ```
 
 ## Viewing the dashboard
@@ -107,7 +113,7 @@ or custom) and the User/Subscription/Model filters. Export to CSV for finance/sh
 ## Teardown
 
 ```bash
-./teardown.sh          # reverts the 4 CR patches, deletes the 2 telemetry CRs
+./teardown.sh          # reverts the 4 CR patches, deletes the 2 maas-controller-owned telemetry CRs
 ./teardown.sh --full   # also uninstalls Tempo/OpenTelemetry/COO operators
 ```
 
@@ -122,14 +128,14 @@ maas-observability/
 ├── teardown.sh                                   # This module's teardown script
 ├── README.md                                     # This file
 └── manifests/
-    ├── operators/
-    │   ├── tempo/{namespace,operatorgroup,subscription}.yaml
-    │   ├── opentelemetry/{namespace,operatorgroup,subscription}.yaml
-    │   └── coo/{namespace,operatorgroup,subscription}.yaml
-    └── telemetry/
-        ├── gateway-telemetry-policy.yaml          # Kuadrant TelemetryPolicy
-        └── istio-gateway-telemetry.yaml           # Istio Telemetry CR
+    └── operators/
+        ├── tempo/{namespace,operatorgroup,subscription}.yaml
+        ├── opentelemetry/{namespace,operatorgroup,subscription}.yaml
+        └── coo/{namespace,operatorgroup,subscription}.yaml
 ```
+
+(No `telemetry/` manifests here — `TelemetryPolicy`/`Telemetry` are auto-created by
+`maas-controller`, not applied by this module. See Step 7 above.)
 
 ## Troubleshooting
 
@@ -156,7 +162,9 @@ oc get crd perses.perses.dev
 
 ### Usage tab shows no data
 - Confirm `Kuadrant.spec.observability.enable` and `Tenant.spec.telemetry.enabled` are both
-  `true` (Step 10's verification output, or re-check with `oc get`).
+  `true` (Step 9's verification output, or re-check with `oc get`).
+- Confirm every `MaaSSubscription` you expect to see data for has `spec.tokenMetadata.
+  organizationId`/`costCenter` set (Step 9's verification lists any that don't).
 - No data is expected until users actually make requests to MaaS models — send a test chat
   completion request, then re-check.
 - The Usage tab does **not** read from the Tempo/OTel/COO stack this script installs (that
@@ -198,10 +206,10 @@ regardless of the `cluster-monitoring-config`/`enableUserWorkload: true` ConfigM
 `../setup-maas.sh` applies (that ConfigMap is inert without the platform monitoring operator
 actually running to read it). Since the Usage tab's datasource depends on that platform
 Thanos Querier, the dashboard will show no data on a stock CRC cluster even though every CR
-this script manages (`PodMonitor`, `TelemetryPolicy`, `Tenant`/`Kuadrant`/`OdhDashboardConfig`
-flags) is correctly configured — verified via `oc get` against each resource directly. This is
-a CRC-only gap; a real OpenShift cluster with platform monitoring enabled (the default) is not
-affected.
+this module is responsible for (`PodMonitor`, `Tenant`/`Kuadrant`/`OdhDashboardConfig` flags,
+and the `maas-controller`-generated `TelemetryPolicy`) is correctly configured — verified via
+`oc get` against each resource directly. This is a CRC-only gap; a real OpenShift cluster with
+platform monitoring enabled (the default) is not affected.
 
 **Fix for CRC**: enable the platform monitoring stack via the CRC config flag, then restart:
 ```bash
@@ -221,27 +229,60 @@ created will start getting scraped without re-applying anything) and retry the v
 steps above.
 
 #### Scraping confirmed working, but still no data: check Limitador's own `/metrics`
-Even after fixing the CRC monitoring gap above, we found a **separate, deeper issue** during
-full end-to-end verification (real traffic through a `TokenRateLimitPolicy`-`Enforced` route):
-Limitador itself was not emitting `authorized_calls`/`authorized_hits`/`limited_calls` at all —
-only the two static `limitador_up`/`datastore_partitioned` gauges, regardless of how many
-successful requests were sent. This is **not** something `maas-observability/setup.sh` controls
-(it only sets `Kuadrant.spec.observability.enable: true`, which correctly creates the
-`PodMonitor` — confirmed scraped and `up` on `prometheus-k8s`). If the Usage tab still shows no
-data after confirming scraping works, check Limitador's own metrics directly before assuming
-this module is at fault:
+Even after fixing the CRC monitoring gap above, we hit a case during full end-to-end
+verification (real traffic through a `TokenRateLimitPolicy`-`Enforced` route) where Limitador
+emitted *no* `authorized_calls`/`authorized_hits`/`limited_calls` at all — only the two static
+`limitador_up`/`datastore_partitioned` gauges, regardless of how many successful requests were
+sent. If you hit this, check Limitador's own metrics directly before assuming the PodMonitor/
+scraping is at fault:
 ```bash
 LIM_POD=$(oc get pod -n kuadrant-system -l app=limitador -o jsonpath='{.items[0].metadata.name}')
 oc exec -n kuadrant-system "$LIM_POD" -- curl -s http://localhost:8080/metrics
 ```
-If this shows only `limitador_up`/`datastore_partitioned` with no `authorized_*`/`limited_*`
-series even after sending real traffic through an `Enforced` `TokenRateLimitPolicy`/
-`RateLimitPolicy`, this is a Kuadrant/Limitador-level gap (observed on RHCL 1.4.2 / Limitador
-v2.4.2) — raise it with Red Hat support rather than treating it as a bug in this module.
 
-### Cardinality / Prometheus growth after enabling `captureUser`
-Revert with:
+**Root cause:** it isn't a scraping or Limitador problem — it's a bug in the `TelemetryPolicy`
+that `maas-controller` (part of RHOAI itself, not this module) auto-generates once `Tenant.
+spec.telemetry.enabled` is true. Its `organization_id`/`cost_center` label expressions
+reference `auth.identity.subscription_info.organizationId`/`costCenter` unconditionally, but
+those are **optional** fields (`MaaSSubscription.spec.tokenMetadata`). When a subscription
+doesn't set them, the CEL expression throws `CelError::Resolve { NoSuchKey(...) }` in the
+gateway's wasm filter (check the gateway pod's logs for this string) — and that error aborts
+the *entire* wasm task for the request, which also carries the `ratelimit-report` call to
+Limitador. So any subscription without `tokenMetadata` silently never reports usage to
+Limitador at all, while the actual inference request still succeeds (the wasm filter fails
+open) — completely invisible to an end user, and easy to misdiagnose as a Limitador or
+Prometheus problem.
+
+**This is not fixable from this repository.** `maas-controller` owns the `TelemetryPolicy`'s
+`spec.metrics.default.labels` via Kubernetes Server-Side Apply and actively reconciles it —
+verified live: deleting the object outright gets it recreated within ~45s; hand-patching the
+CEL to be `has()`-guarded (which does fix the underlying bug — confirmed functionally correct
+in isolated testing) gets silently reverted within ~17s by `maas-controller`'s own reconcile
+loop. There is no supported way to durably change this object from outside `maas-controller`
+itself. (This module used to apply its own copy of this CR for exactly this reason, hoping to
+own it — that didn't work either, and the step was removed; see Step 7 above.)
+
+**Actual fix — set `tokenMetadata` on the subscription, not the `TelemetryPolicy`:**
 ```bash
-oc patch tenants.maas.opendatahub.io default-tenant -n models-as-a-service \
-  --type=merge -p '{"spec":{"telemetry":{"metrics":{"captureUser":false}}}}'
+oc patch maassubscription <name> -n <namespace> --type=merge \
+  -p '{"spec":{"tokenMetadata":{"organizationId":"<org-id>","costCenter":"<cost-center>"}}}'
 ```
+This works because `MaaSSubscription` isn't touched by `maas-controller`'s `TelemetryPolicy`
+reconciliation — it's a durable, data-side fix. Verified live: within one request after
+patching, `authorized_calls`/`authorized_hits` appear in Limitador's `/metrics`, correctly
+labeled, and the Usage tab populates. `setup.sh`'s Step 9 lists any `MaaSSubscription` missing
+this field.
+
+**Already fixed upstream, not yet GA:** confirmed via
+[PR #1276](https://github.com/opendatahub-io/models-as-a-service/pull/1276)/
+[#1311](https://github.com/opendatahub-io/models-as-a-service/pull/1311)/
+[#1312](https://github.com/opendatahub-io/models-as-a-service/pull/1312) in
+`opendatahub-io/models-as-a-service` — the exact `has()`-guard fix, already merged (including a
+`release-3.4` backport). It lands in RHOAI **3.4.4**, which is not yet released — current GA is
+**3.4.2**. Until you're on a build that includes the fix, the `tokenMetadata` workaround above
+is required.
+
+### Cardinality / Prometheus growth from `captureUser`
+`captureUser` is on by default (Step 7) — see [Disabling per-user
+metrics](#disabling-per-user-metrics) above if a large user base is growing the Prometheus
+database more than you'd like.
