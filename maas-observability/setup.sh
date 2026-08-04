@@ -408,16 +408,11 @@ print_summary() {
     -o jsonpath='https://{.spec.host}' 2>/dev/null || echo 'see: oc get route -n redhat-ods-applications')"
   echo
   echo -e "  ${BOLD}Per-user metrics are ON by default${NC} (captureUser=true) — required for the"
-  echo -e "  Usage tab's per-user filtered queries to return data; see"
-  echo -e "  ../KCS-MAAS-WASM-SHIM-CONTEXT-ID-USER-LABEL.md for why. To disable (reduces Prometheus"
-  echo -e "  cardinality, loses per-user breakdown):"
-  echo -e "     oc patch tenants.maas.opendatahub.io ${MAAS_TENANT_NAME} -n ${MAAS_TENANT_NS} \\"
-  echo -e "       --type=merge -p '{\"spec\":{\"telemetry\":{\"metrics\":{\"captureUser\":false}}}}'"
+  echo -e "  Usage tab's per-user filtered queries to return data"
   echo
   echo -e "  ${RED}${BOLD}Required for the Usage tab to show any data (on RHOAI <= 3.4.2):${NC} every"
   echo -e "  MaaSSubscription needs spec.tokenMetadata.organizationId/costCenter set (Step 9 above"
   echo -e "  lists any that don't). Fixed upstream for RHOAI 3.4.4+ (maas-controller PR #1276/#1311)"
-  echo -e "  — see ../KCS-MAAS-TELEMETRY-COSTCENTER-CEL.md for details."
   echo -e "     oc patch maassubscription <name> -n <namespace> --type=merge \\"
   echo -e "       -p '{\"spec\":{\"tokenMetadata\":{\"organizationId\":\"<org>\",\"costCenter\":\"<cc>\"}}}'"
   echo
