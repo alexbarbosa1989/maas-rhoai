@@ -1,7 +1,11 @@
 # Gateway API Gateway for MaaS model endpoints.
 # The maas-controller's default-tenant expects this exact name/namespace:
 #   openshift-ingress/maas-default-gateway
-# allowedRoutes: All — lets tenant namespaces attach HTTPRoutes to this gateway.
+# allowedRoutes: Selector — only namespaces labeled maas-gateway-access=true may attach
+# HTTPRoutes. Using "from: All" here lets any namespace on the cluster attach a route and
+# hijack MaaS traffic via Gateway API's Exact-beats-PathPrefix conflict resolution (see
+# access.redhat.com/solutions/7145755). setup-maas.sh labels the required namespaces before
+# applying this manifest — see configure_maas_gateway() and create_model_namespace().
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -29,7 +33,10 @@ spec:
     protocol: HTTPS
     allowedRoutes:
       namespaces:
-        from: All
+        from: Selector
+        selector:
+          matchLabels:
+            maas-gateway-access: "true"
     tls:
       mode: Terminate
       certificateRefs:

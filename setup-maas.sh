@@ -223,8 +223,50 @@ configure_maas_gateway() {
   # The maas-controller's default-tenant expects a Gateway named maas-default-gateway
   # in openshift-ingress. RHOAI does not create it automatically.
 
+  # Security (access.redhat.com/solutions/7145755): 06c-maas-gateway.yaml uses a
+  # Selector-based allowedRoutes, not "All" — "All" lets any namespace on the cluster
+  # attach an HTTPRoute and hijack MaaS traffic. Label the MaaS infra namespace before the
+  # Gateway is created/reconciled below, or maas-controller's own internal maas-api-route
+  # (used by the dashboard's API Keys page) won't attach. create_model_namespace() labels
+  # MAAS_MODEL_NS the same way when it creates that namespace.
+  oc label namespace "$RHOAI_APP_NS" maas-gateway-access="true" --overwrite &>/dev/null
+  log_ok "Namespace '${RHOAI_APP_NS}' labeled maas-gateway-access=true."
+
   if resource_exists gateway maas-default-gateway "openshift-ingress"; then
-    log_warn "Gateway 'maas-default-gateway' already exists — skipping."
+    log_warn "Gateway 'maas-default-gateway' already exists — skipping creation."
+
+    # Upgrade path: a Gateway created by an older version of this script may still carry
+    # the insecure allowedRoutes.namespaces.from: All default. Reconcile it here so
+    # re-running the script on an existing install picks up the fix. type=merge replaces
+    # spec.listeners wholesale (it's a list), so the patch must restate the full listener,
+    # not just allowedRoutes, or port/protocol/tls would be dropped.
+    local allowed_from
+    allowed_from=$(oc get gateway maas-default-gateway -n openshift-ingress \
+      -o jsonpath='{.spec.listeners[0].allowedRoutes.namespaces.from}' 2>/dev/null)
+    if [[ "$allowed_from" == "All" ]]; then
+      log_warn "Existing Gateway uses allowedRoutes.namespaces.from: All (route-hijacking exposure — access.redhat.com/solutions/7145755)."
+      log_warn "Patching to Selector. Any namespace not labeled maas-gateway-access=true will lose route access until labeled."
+      oc patch gateway maas-default-gateway -n openshift-ingress --type=merge -p '{
+        "spec": {
+          "listeners": [{
+            "name": "https",
+            "port": 443,
+            "protocol": "HTTPS",
+            "allowedRoutes": {
+              "namespaces": {
+                "from": "Selector",
+                "selector": {"matchLabels": {"maas-gateway-access": "true"}}
+              }
+            },
+            "tls": {
+              "mode": "Terminate",
+              "certificateRefs": [{"group": "", "kind": "Secret", "name": "maas-default-gateway-service-tls"}]
+            }
+          }]
+        }
+      }'
+      log_ok "Gateway 'maas-default-gateway' patched to Selector-based allowedRoutes."
+    fi
   else
     apply_manifest "${MANIFESTS_DIR}/06b-maas-gateway-configmap.yaml"
     apply_manifest "${MANIFESTS_DIR}/06c-maas-gateway.yaml"
@@ -573,6 +615,12 @@ create_model_namespace() {
     apply_manifest "${MANIFESTS_DIR}/07-model-namespace.yaml"
     log_ok "Namespace '${MAAS_MODEL_NS}' created."
   fi
+
+  # Always (re)apply the label, even if the namespace pre-existed from an older version of
+  # this script — required for its HTTPRoutes to attach to the Selector-based Gateway from
+  # Step 4 (access.redhat.com/solutions/7145755).
+  oc label namespace "$MAAS_MODEL_NS" maas-gateway-access="true" --overwrite &>/dev/null
+  log_ok "Namespace '${MAAS_MODEL_NS}' labeled maas-gateway-access=true."
 
   # Patch namespace name in YAML uses the variable; no further action needed.
   log_info "To deploy models, create LLMInferenceService resources in '${MAAS_MODEL_NS}'."

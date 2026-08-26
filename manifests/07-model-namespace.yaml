@@ -1,5 +1,7 @@
 # Namespace where MaaS LLM models are deployed by the platform team.
 # The label opendatahub.io/dashboard: "true" makes it visible in the RHOAI dashboard.
+# The label maas-gateway-access: "true" is required for LLMInferenceService HTTPRoutes here
+# to attach to maas-default-gateway (see 06c-maas-gateway.yaml and access.redhat.com/solutions/7145755).
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -7,3 +9,4 @@ metadata:
   labels:
     opendatahub.io/dashboard: "true"
     kubernetes.io/metadata.name: maas-models
+    maas-gateway-access: "true"
