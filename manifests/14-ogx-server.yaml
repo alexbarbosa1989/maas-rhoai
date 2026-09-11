@@ -1,22 +1,39 @@
-# LlamaStack Distribution for the RHOAI GenAI Playground
+# OGXServer for the RHOAI GenAI Playground (RHOAI 3.5+, replaces LlamaStackDistribution)
 #
-# The dashboard's GenAI Playground connects to a LlamaStackDistribution,
-# not directly to the LLMInferenceService. This manifest creates both
-# the ConfigMap and the LlamaStackDistribution CR.
+# The dashboard's GenAI Playground connects to an OGXServer, not directly to the
+# LLMInferenceService. This is the OGX analog of manifests/13-llamastack-distribution.yaml,
+# translated per ogx-migration.md's confirmed field mapping: API group/kind/version,
+# container run command, env var renames (LLAMA_STACK_CONFIG_DIR -> OGX_CONFIG_DIR),
+# mount-path renames (/.llama -> /.ogx), and the ogx.io/watch ConfigMap label.
 #
-# Spec mirrors the working lsd-genai-playground created via the dashboard
-# on a ROSA HCP cluster running RHOAI 3.4 / LlamaStack 0.7.2+rhaiv.0.
+# The OGXServer spec below (distribution/network/overrideConfig/workload shape, the
+# `ogx run /etc/ogx/config.yaml --insecure` command, and the VLLM_MAX_TOKENS_1 env var
+# name) is copied verbatim from a live, working OGXServer inspected on a CRC cluster
+# running RHOAI 3.5.0 (created via the dashboard's "Create playground" flow) — not
+# guessed from docs.
+#
+# NOT reproduced here: the pgvector-backed RAG vector store that the RHOAI 3.5 dashboard
+# auto-provisions alongside a dashboard-created Playground (observed live as a companion
+# genai-pgvector Deployment/Service/Secret/PVC, owned by the OGXServer, wired in via
+# PGVECTOR_* env vars). That behavior's trigger and its config.yaml vector_io schema were
+# never captured verbatim from a live cluster, so this manifest keeps the original
+# config's self-contained inline::milvus vector store instead — verified working, no
+# external DB dependency. If you need the pgvector-backed RAG store, create a Playground
+# via the dashboard once and diff its generated OGXServer/ConfigMap against this file.
 #
 # Prerequisites:
 #   - LLMInferenceService llama-3-8b must be Ready in maas-models
 #   - namespace maas-models must exist (created by setup-maas.sh)
 #
 # Apply after 08-example-llminferenceservice.yaml is Ready:
-#   oc apply -f manifests/13-llamastack-distribution.yaml
+#   oc apply -f manifests/14-ogx-server.yaml
 #
 # Verify:
-#   oc get llamastackdistribution lsd-genai-playground -n maas-models
-#   oc logs -n maas-models -l app=lsd-genai-playground --tail=30
+#   oc get ogxserver lsd-genai-playground -n maas-models
+#   oc logs -n maas-models -l app.kubernetes.io/instance=lsd-genai-playground --tail=30
+#
+# Remove (or use ./remove-ogx-playground.sh maas-models for a full sweep):
+#   oc delete -f manifests/14-ogx-server.yaml
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -25,18 +42,21 @@ metadata:
   namespace: maas-models
   labels:
     opendatahub.io/dashboard: "true"
+    ogx.io/watch: "true"
 data:
   config.yaml: |
-    # Llama Stack Configuration
+    # OGX Server Configuration
     version: "2"
     distro_name: rh
+    # apis: trimmed to what this OGX build's Api enum actually recognizes — confirmed
+    # live via `python3 -c "import ogx_api.datatypes as d; print([e.value for e in d.Api])"`
+    # inside the running ogx image. "datasetio", "safety", "scoring", and "eval" (all
+    # present in the old LlamaStack config this was translated from) are NOT in that
+    # enum and crash the server at startup with e.g. "API 'datasetio' does not exist."
     apis:
     - responses
-    - datasetio
     - files
     - inference
-    - safety
-    - scoring
     - tool_runtime
     - vector_io
     providers:
@@ -49,13 +69,13 @@ data:
         config:
           api_token: ${env.VLLM_API_TOKEN_1:=fake}
           base_url: https://llama-3-8b-kserve-workload-svc.maas-models.svc.cluster.local:8000/v1
-          max_tokens: ${env.VLLM_MAX_TOKENS:=4096}
+          max_tokens: ${env.VLLM_MAX_TOKENS_1:=4096}
           tls_verify: ${env.VLLM_TLS_VERIFY:=true}
       vector_io:
       - provider_id: milvus
         provider_type: inline::milvus
         config:
-          db_path: /opt/app-root/src/.llama/distributions/rh/milvus.db
+          db_path: /opt/app-root/src/.ogx/distributions/rh/milvus.db
           persistence:
             backend: kv_default
             namespace: vector_io::milvus
@@ -72,7 +92,6 @@ data:
               max_write_queue_size: 10000
               num_writers: 4
               table_name: responses
-      eval: []
       files:
       - provider_id: meta-reference-files
         provider_type: inline::localfs
@@ -80,21 +99,7 @@ data:
           metadata_store:
             backend: sql_default
             table_name: files_metadata
-          storage_dir: /opt/app-root/src/.llama/distributions/rh/files
-      datasetio:
-      - provider_id: huggingface
-        provider_type: remote::huggingface
-        config:
-          kvstore:
-            backend: kv_default
-            namespace: datasetio::huggingface
-      scoring:
-      - provider_id: basic
-        provider_type: inline::basic
-        config: {}
-      - provider_id: llm-as-judge
-        provider_type: inline::llm-as-judge
-        config: {}
+          storage_dir: /opt/app-root/src/.ogx/distributions/rh/files
       tool_runtime:
       - provider_id: file-search
         provider_type: inline::file-search
@@ -102,17 +107,16 @@ data:
       - provider_id: model-context-protocol
         provider_type: remote::model-context-protocol
         config: {}
-      safety: []
     metadata_store:
       type: sqlite
-      db_path: /opt/app-root/src/.llama/distributions/rh/inference_store.db
+      db_path: /opt/app-root/src/.ogx/distributions/rh/inference_store.db
     storage:
       backends:
         kv_default:
-          db_path: /opt/app-root/src/.llama/distributions/rh/kvstore.db
+          db_path: /opt/app-root/src/.ogx/distributions/rh/kvstore.db
           type: kv_sqlite
         sql_default:
-          db_path: /opt/app-root/src/.llama/distributions/rh/sql_store.db
+          db_path: /opt/app-root/src/.ogx/distributions/rh/sql_store.db
           type: sql_sqlite
       stores:
         conversations:
@@ -137,6 +141,10 @@ data:
         model_type: embedding
         metadata:
           embedding_dimension: 768
+      - provider_id: vllm-inference-1
+        model_id: llama-3-8b
+        model_type: llm
+        metadata: {}
       shields: []
       vector_stores: []
       datasets: []
@@ -145,8 +153,8 @@ data:
     server:
       port: 8321
 ---
-apiVersion: llamastack.io/v1alpha1
-kind: LlamaStackDistribution
+apiVersion: ogx.io/v1beta1
+kind: OGXServer
 metadata:
   name: lsd-genai-playground
   namespace: maas-models
@@ -155,30 +163,34 @@ metadata:
   labels:
     opendatahub.io/dashboard: "true"
 spec:
-  replicas: 1
-  server:
-    distribution:
-      name: rh-dev
-    containerSpec:
-      name: llama-stack
+  distribution:
+    name: rh    # was "rh-dev" in the initially-captured live example; the operator now
+                # emits "spec.distribution.name \"rh-dev\" is deprecated, use \"rh\" instead"
+  network:
+    port: 8321
+  overrideConfig:
+    name: llama-stack-config
+    key: config.yaml
+  workload:
+    replicas: 1
+    overrides:
       command:
       - /bin/sh
       - -c
-      - llama stack run /etc/llama-stack/config.yaml
-      port: 8321
+      - ogx run /etc/ogx/config.yaml --insecure
       env:
       - name: VLLM_TLS_VERIFY
         value: "false"
       - name: VLLM_API_TOKEN_1
         value: fake
-      - name: VLLM_MAX_TOKENS
+      - name: VLLM_MAX_TOKENS_1
         value: "4096"
       - name: MILVUS_DB_PATH
-        value: ~/.llama/milvus.db
+        value: ~/.ogx/milvus.db
       - name: FMS_ORCHESTRATOR_URL
         value: http://localhost
-      - name: LLAMA_STACK_CONFIG_DIR
-        value: /opt/app-root/src/.llama/distributions/rh/
+      - name: OGX_CONFIG_DIR
+        value: /opt/app-root/src/.ogx/distributions/rh/
       resources:
         requests:
           cpu: 250m
@@ -186,13 +198,3 @@ spec:
         limits:
           cpu: "2"
           memory: 12Gi
-    userConfig:
-      configMapName: llama-stack-config
-    storage:
-      size: 2Gi
-      mountPath: /opt/app-root/src/.llama
-  network:
-    exposeRoute: false
-    allowedFrom:
-      namespaces:
-      - "*"

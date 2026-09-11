@@ -122,11 +122,11 @@ check_prerequisites() {
   rhoai_version=$(echo "$rhoai_csv" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
   log_ok "RHOAI operator found: ${rhoai_csv} (version ${rhoai_version})"
 
-  # RHOAI minimum version check (3.4)
-  local major minor
-  major=$(echo "$rhoai_version" | cut -d. -f1)
-  minor=$(echo "$rhoai_version" | cut -d. -f2)
-  if (( major < 3 || (major == 3 && minor < 4) )); then
+  # RHOAI minimum version check (3.4). Also exported (not `local`) as RHOAI_MAJOR/RHOAI_MINOR
+  # so later steps (Step 10) can branch LlamaStack-vs-OGX behavior on the same detection.
+  RHOAI_MAJOR=$(echo "$rhoai_version" | cut -d. -f1)
+  RHOAI_MINOR=$(echo "$rhoai_version" | cut -d. -f2)
+  if (( RHOAI_MAJOR < 3 || (RHOAI_MAJOR == 3 && RHOAI_MINOR < 4) )); then
     log_error "MaaS with LLMInferenceService requires RHOAI >= 3.4 (found ${rhoai_version})."
     exit 1
   fi
@@ -419,6 +419,10 @@ apply_maas_api_rbac_workaround() {
 
 enable_maas_in_dsc() {
   log_step "Step 8: Enabling MaaS (modelsAsService) in the DataScienceCluster"
+  # RHOAI 3.4.x only — spec.components.kserve.modelsAsService is deprecated starting
+  # 3.5 (preserved for backward compatibility through 3.6 per the DSC CRD schema, but its
+  # CEL rule is one-directional: Managed→Removed is allowed, Removed→Managed is BLOCKED).
+  # main()'s version dispatch below selects enable_maas_in_dsc_aigateway() instead on 3.5+.
 
   local current_state
   current_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
@@ -504,6 +508,81 @@ enable_maas_in_dsc() {
   fi
 }
 
+enable_maas_in_dsc_aigateway() {
+  log_step "Step 8: Enabling MaaS (aigateway.modelsAsAService) in the DataScienceCluster"
+  # RHOAI 3.5+ only. Confirmed live against a 3.5.0 cluster: MaaS moved from
+  # spec.components.kserve.modelsAsService to spec.components.aigateway.modelsAsAService
+  # (note the double-A — not a typo), gated by the PARENT aigateway.managementState, which
+  # defaults to Removed if unset. Setting only the modelsAsAService submodule without the
+  # parent silently no-ops (DSC status: AIGatewayReady=False/Removed,
+  # ModelsAsAServiceReady=False/Removed, "Submodule ManagementState is set to Removed" —
+  # even though the submodule's own spec value reads Managed). Both must be set.
+  #
+  # This also moves maas-api/maas-controller out of the old models-as-a-service namespace
+  # into redhat-ai-gateway-infra and a namespaced ai-tenants layout — the 3.4.x
+  # apply_maas_api_rbac_workaround (06h-maas-api-rbac-workaround.yaml, scoped to
+  # deployment maas-api in RHOAI_APP_NS) does not apply here and is intentionally skipped.
+
+  local aigw_state maas_state
+  aigw_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    -o jsonpath='{.spec.components.aigateway.managementState}' 2>/dev/null)
+  maas_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    -o jsonpath='{.spec.components.aigateway.modelsAsAService.managementState}' 2>/dev/null)
+
+  if [[ "$aigw_state" == "Managed" && "$maas_state" == "Managed" ]]; then
+    log_warn "aigateway and aigateway.modelsAsAService are already Managed — skipping patch."
+  else
+    log_info "Current aigateway.managementState: '${aigw_state:-unset}', modelsAsAService: '${maas_state:-unset}' → both Managed"
+    oc patch dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      --type=merge \
+      -p '{"spec":{"components":{"aigateway":{"managementState":"Managed","modelsAsAService":{"managementState":"Managed"}}}}}'
+  fi
+
+  log_info "Waiting for DataScienceCluster conditions 'AIGatewayReady' and 'ModelsAsAServiceReady'…"
+  local deadline=$(( $(date +%s) + OPERATOR_WAIT_TIMEOUT ))
+  local dashboard_fix_applied=false
+  while true; do
+    local aigw_ready maas_ready
+    aigw_ready=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      -o jsonpath='{.status.conditions[?(@.type=="AIGatewayReady")].status}' 2>/dev/null)
+    maas_ready=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].status}' 2>/dev/null)
+    if [[ "$aigw_ready" == "True" && "$maas_ready" == "True" ]]; then
+      log_ok "AIGatewayReady and ModelsAsAServiceReady are both True."
+      break
+    fi
+
+    # Same dashboard rolling-update deadlock as the 3.4.x path (resource-constrained
+    # nodes, maxUnavailable=0) — this is generic to the Dashboard component, not tied to
+    # which MaaS field enabled it, so it's still worth checking here.
+    if [[ "$dashboard_fix_applied" == "false" ]]; then
+      local dash_ready
+      dash_ready=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+        -o jsonpath='{.status.conditions[?(@.type=="DashboardReady")].status}' 2>/dev/null)
+      if [[ "$dash_ready" == "False" ]]; then
+        local dash_progressing
+        dash_progressing=$(oc get deployment rhods-dashboard -n "$RHOAI_APP_NS" \
+          -o jsonpath='{.status.conditions[?(@.type=="Progressing")].reason}' 2>/dev/null)
+        if [[ "$dash_progressing" == "ProgressDeadlineExceeded" ]]; then
+          log_warn "Dashboard rollout deadlocked (ProgressDeadlineExceeded) — likely insufficient CPU headroom for rolling update on this node."
+          log_warn "Applying fix: maxUnavailable=1, maxSurge=0 to allow old pod to be replaced first."
+          oc patch deployment rhods-dashboard -n "$RHOAI_APP_NS" --type=merge \
+            -p '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":1,"maxSurge":0}}}}' \
+            && dashboard_fix_applied=true \
+            || log_warn "Could not patch Dashboard deployment strategy — will keep waiting."
+        fi
+      fi
+    fi
+
+    if (( $(date +%s) > deadline )); then
+      log_error "Timed out waiting for AIGatewayReady/ModelsAsAServiceReady."
+      oc describe dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" 2>/dev/null | tail -30
+      return 1
+    fi
+    sleep 10
+  done
+}
+
 enable_genai_studio() {
   log_step "Step 9: Enabling GenAI Studio in OdhDashboardConfig"
 
@@ -533,6 +612,10 @@ enable_llamastack_operator() {
   # The dashboard's GenAI Playground renders only if genAiStudio is enabled AND the
   # LlamaStack operator component is Managed. genAiStudio alone (Step 9) is not enough —
   # without this, the playground UI is hidden even though the flag is on.
+  #
+  # RHOAI 3.4.x only — LlamaStack is replaced by OGX starting 3.5EA1 (see
+  # ogx-migration.md and enable_ogx_operator() below). This function is selected by
+  # main()'s version dispatch, not called directly on 3.5+ clusters.
 
   local current_state
   current_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
@@ -554,50 +637,131 @@ enable_llamastack_operator() {
   log_ok "llamastackoperator enabled in DataScienceCluster."
 }
 
-verify_maas_components() {
-  log_step "Step 11: Verifying all MaaS platform components"
+enable_ogx_operator() {
+  log_step "Step 10: Enabling OGX component in the DataScienceCluster (required for GenAI Playground, RHOAI 3.5+)"
+  # RHOAI 3.5EA1+ only — OGX ("Open GenAI Stack") replaces the LlamaStack operator as the
+  # Playground backend. Same field-level detection logic as setup-maas-ogx.sh's
+  # enable_ogx_operator/validate_ogx_components, verified live against a 3.5.0 cluster.
+  # This function does NOT set llamastackoperator to Removed (that's a migration concern,
+  # not an initial-setup one — see setup-maas-ogx.sh --keep-llamastack default behavior
+  # if you need that on an existing 3.4→3.5 upgrade rather than a fresh 3.5 install).
 
-  # model-serving-api — LLM catalogue REST API
-  wait_for_pods "$RHOAI_APP_NS" "app.kubernetes.io/name=model-serving-api" "$POD_WAIT_TIMEOUT"
+  local current_state
+  current_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    -o jsonpath='{.spec.components.ogx.managementState}' 2>/dev/null)
 
-  # llmisvc-controller-manager — reconciles LLMInferenceService resources
-  wait_for_pods "$RHOAI_APP_NS" "control-plane=llmisvc-controller-manager" "$POD_WAIT_TIMEOUT"
-
-  # Guaranteed application point for the maas-api RBAC workaround: Step 8's DSC-Ready
-  # wait loop applies it opportunistically, but that loop can exit as soon as the DSC's
-  # top-level Ready condition goes True — which can happen before maas-api's own
-  # ModelsAsServiceReady-relevant crash-loop even surfaces (confirmed live: DSC Ready
-  # flipped True on the very first check, before models-as-a-service/maas-api had
-  # stabilized). By this point in Step 11 the namespace reliably exists, so apply it
-  # unconditionally here as the real backstop.
-  apply_maas_api_rbac_workaround
-
-  # maas-api — MaaS platform API (needs PostgreSQL to be up first). wait_for_pods only
-  # checks pod phase=Running, which a crash-looping pod can transiently satisfy between
-  # restarts — so also confirm the Deployment's rollout actually completes. Using
-  # `oc rollout status` (not a raw `oc wait` on pods) both prints its own progress lines
-  # (so this doesn't look hung for minutes) and avoids getting stuck on an old,
-  # about-to-be-replaced pod that still matches the label selector during a restart.
-  wait_for_pods "$RHOAI_APP_NS" "app.kubernetes.io/name=maas-api" "$POD_WAIT_TIMEOUT" \
-    || { log_error "maas-api pod not Running. Check PostgreSQL connectivity."; exit 1; }
-  if ! oc rollout status deployment/maas-api -n "$RHOAI_APP_NS" --timeout="${POD_WAIT_TIMEOUT}s"; then
-    log_warn "maas-api not yet available — restarting once to pick up the RBAC workaround…"
-    oc rollout restart deployment/maas-api -n "$RHOAI_APP_NS"
-    oc rollout status deployment/maas-api -n "$RHOAI_APP_NS" --timeout="${POD_WAIT_TIMEOUT}s" \
-      || { log_error "maas-api still not available after restart. Check its logs for a forbidden/RBAC error."; exit 1; }
+  if [[ "$current_state" == "Managed" ]]; then
+    log_ok "ogx is already Managed — skipping patch."
+  else
+    log_info "Current ogx.managementState: '${current_state:-unset}' → Managed"
+    oc patch dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      --type=merge \
+      -p '{"spec":{"components":{"ogx":{"managementState":"Managed"}}}}'
+    log_ok "ogx enabled in DataScienceCluster."
   fi
 
-  # maas-controller — manages Tenant, MaaSAuthPolicy, etc.
+  wait_for_condition "dsc/${DSC_NAME}" "$RHOAI_OPERATOR_NS" \
+    "OGXReady" "$OPERATOR_WAIT_TIMEOUT" \
+    || { log_error "OGXReady never reached True. Check the ogx-k8s-operator logs."; exit 1; }
+
+  # The OGX component CR (kind OGX) is cluster-scoped, unlike llamastackoperator's
+  # equivalent DSC condition alone — wait_for_condition assumes a namespaced resource,
+  # so poll inline here (same approach as setup-maas-ogx.sh's validate_ogx_components).
+  log_info "Waiting for the OGX component CR to report Ready…"
+  local ogx_deadline=$(( $(date +%s) + OPERATOR_WAIT_TIMEOUT ))
+  local ogx_name=""
+  while true; do
+    ogx_name=$(oc get ogx -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -n "$ogx_name" ]]; then
+      local ogx_ready
+      ogx_ready=$(oc get ogx "$ogx_name" \
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+      [[ "$ogx_ready" == "True" ]] && { log_ok "OGX component CR '${ogx_name}' is Ready."; break; }
+    fi
+    if (( $(date +%s) > ogx_deadline )); then
+      log_error "OGX component CR not Ready after ${OPERATOR_WAIT_TIMEOUT}s."
+      oc get ogx 2>/dev/null
+      exit 1
+    fi
+    sleep 10
+  done
+
+  wait_for_pods "$RHOAI_APP_NS" "app.kubernetes.io/name=ogx-k8s-operator" "$POD_WAIT_TIMEOUT" \
+    || { log_error "ogx-k8s-operator-controller-manager pod not Running."; exit 1; }
+  wait_for_pods "$RHOAI_APP_NS" "app.kubernetes.io/name=opendatahub-ogx-operator" "$POD_WAIT_TIMEOUT" \
+    || { log_error "opendatahub-ogx-operator pod not Running."; exit 1; }
+  log_ok "OGX operator pods are Running in '${RHOAI_APP_NS}'."
+}
+
+verify_maas_components() {
+  # $1: "true" on RHOAI 3.5+ (set by main()'s version dispatch), "false"/unset on 3.4.x.
+  # GatewayConfig is confirmed cluster-scoped on both (gatewayconfigs.services.platform.
+  # opendatahub.io) — the "-n $RHOAI_APP_NS" below is accepted but has no effect either way.
+  local is_35_plus="${1:-false}"
+  log_step "Step 11: Verifying all MaaS platform components"
+
+  # model-serving-api and llmisvc-controller-manager — confirmed unchanged on 3.5+ (same
+  # namespace/labels, verified live), so no branching needed for these two.
+  wait_for_pods "$RHOAI_APP_NS" "app.kubernetes.io/name=model-serving-api" "$POD_WAIT_TIMEOUT"
+  wait_for_pods "$RHOAI_APP_NS" "control-plane=llmisvc-controller-manager" "$POD_WAIT_TIMEOUT"
+
+  if [[ "$is_35_plus" == "true" ]]; then
+    # maas-api moved out of RHOAI_APP_NS into a dedicated infra namespace on 3.5+
+    # (confirmed live: redhat-ai-gateway-infra), alongside new payload-processing pods in
+    # openshift-ingress. The 3.4.x maas-api RBAC-skew workaround (06h manifest, scoped to
+    # deployment maas-api in RHOAI_APP_NS) has no evidence of applying to this new
+    # architecture — intentionally not called here.
+    local ai_gateway_infra_ns="${AI_GATEWAY_INFRA_NS:-redhat-ai-gateway-infra}"
+    wait_for_pods "$ai_gateway_infra_ns" "app.kubernetes.io/name=maas-api" "$POD_WAIT_TIMEOUT" \
+      || { log_error "maas-api pod not Running in '${ai_gateway_infra_ns}'. Check PostgreSQL/DB connectivity."; exit 1; }
+    oc rollout status deployment/maas-api -n "$ai_gateway_infra_ns" --timeout="${POD_WAIT_TIMEOUT}s" \
+      || { log_error "maas-api not available in '${ai_gateway_infra_ns}'. Check its logs."; exit 1; }
+  else
+    # Guaranteed application point for the maas-api RBAC workaround: Step 8's DSC-Ready
+    # wait loop applies it opportunistically, but that loop can exit as soon as the DSC's
+    # top-level Ready condition goes True — which can happen before maas-api's own
+    # ModelsAsServiceReady-relevant crash-loop even surfaces (confirmed live: DSC Ready
+    # flipped True on the very first check, before models-as-a-service/maas-api had
+    # stabilized). By this point in Step 11 the namespace reliably exists, so apply it
+    # unconditionally here as the real backstop.
+    apply_maas_api_rbac_workaround
+
+    # maas-api — MaaS platform API (needs PostgreSQL to be up first). wait_for_pods only
+    # checks pod phase=Running, which a crash-looping pod can transiently satisfy between
+    # restarts — so also confirm the Deployment's rollout actually completes. Using
+    # `oc rollout status` (not a raw `oc wait` on pods) both prints its own progress lines
+    # (so this doesn't look hung for minutes) and avoids getting stuck on an old,
+    # about-to-be-replaced pod that still matches the label selector during a restart.
+    wait_for_pods "$RHOAI_APP_NS" "app.kubernetes.io/name=maas-api" "$POD_WAIT_TIMEOUT" \
+      || { log_error "maas-api pod not Running. Check PostgreSQL connectivity."; exit 1; }
+    if ! oc rollout status deployment/maas-api -n "$RHOAI_APP_NS" --timeout="${POD_WAIT_TIMEOUT}s"; then
+      log_warn "maas-api not yet available — restarting once to pick up the RBAC workaround…"
+      oc rollout restart deployment/maas-api -n "$RHOAI_APP_NS"
+      oc rollout status deployment/maas-api -n "$RHOAI_APP_NS" --timeout="${POD_WAIT_TIMEOUT}s" \
+        || { log_error "maas-api still not available after restart. Check its logs for a forbidden/RBAC error."; exit 1; }
+    fi
+  fi
+
+  # maas-controller — manages Tenant, MaaSAuthPolicy, etc. Confirmed unchanged on 3.5+
+  # (still in RHOAI_APP_NS, same control-plane label).
   wait_for_pods "$RHOAI_APP_NS" "control-plane=maas-controller" "$POD_WAIT_TIMEOUT"
 
-  # GatewayConfig should be Ready
+  # GatewayConfig should be Ready (cluster-scoped on both versions)
   wait_for_condition "gatewayconfig/default-gateway" "$RHOAI_APP_NS" \
     "GatewayConfigReady" "$POD_WAIT_TIMEOUT"
 
-  # Final: DSC ModelsAsServiceReady
-  wait_for_condition "dsc/${DSC_NAME}" "$RHOAI_OPERATOR_NS" \
-    "ModelsAsServiceReady" "$POD_WAIT_TIMEOUT" \
-    || { log_error "ModelsAsServiceReady never reached True. Check maas-controller logs."; exit 1; }
+  # Final: DSC condition name differs by version (see enable_maas_in_dsc_aigateway for the
+  # field-mapping background — ModelsAsServiceReady is the 3.4.x condition tied to the
+  # deprecated kserve.modelsAsService field; ModelsAsAServiceReady is its 3.5+ replacement).
+  if [[ "$is_35_plus" == "true" ]]; then
+    wait_for_condition "dsc/${DSC_NAME}" "$RHOAI_OPERATOR_NS" \
+      "ModelsAsAServiceReady" "$POD_WAIT_TIMEOUT" \
+      || { log_error "ModelsAsAServiceReady never reached True. Check maas-controller logs."; exit 1; }
+  else
+    wait_for_condition "dsc/${DSC_NAME}" "$RHOAI_OPERATOR_NS" \
+      "ModelsAsServiceReady" "$POD_WAIT_TIMEOUT" \
+      || { log_error "ModelsAsServiceReady never reached True. Check maas-controller logs."; exit 1; }
+  fi
 
   local domain
   domain=$(oc get gatewayconfig default-gateway -n "$RHOAI_APP_NS" \
@@ -634,9 +798,25 @@ print_summary() {
   domain=$(oc get gatewayconfig default-gateway -n "$RHOAI_APP_NS" \
     -o jsonpath='{.status.domain}' 2>/dev/null || echo "<domain>")
 
-  local maas_state
-  maas_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
-    -o jsonpath='{.spec.components.kserve.modelsAsService.managementState}' 2>/dev/null)
+  local rhoai_is_35_plus=false
+  (( RHOAI_MAJOR > 3 || (RHOAI_MAJOR == 3 && RHOAI_MINOR >= 5) )) && rhoai_is_35_plus=true
+
+  local maas_state maas_ready maas_api_ns maas_label_title
+  if [[ "$rhoai_is_35_plus" == "true" ]]; then
+    maas_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      -o jsonpath='{.spec.components.aigateway.modelsAsAService.managementState}' 2>/dev/null)
+    maas_ready=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      -o jsonpath='{.status.conditions[?(@.type=="ModelsAsAServiceReady")].status}' 2>/dev/null || echo "N/A")
+    maas_api_ns="${AI_GATEWAY_INFRA_NS:-redhat-ai-gateway-infra}"
+    maas_label_title="ModelsAsAServiceReady"
+  else
+    maas_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      -o jsonpath='{.spec.components.kserve.modelsAsService.managementState}' 2>/dev/null)
+    maas_ready=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      -o jsonpath='{.status.conditions[?(@.type=="ModelsAsServiceReady")].status}' 2>/dev/null || echo "N/A")
+    maas_api_ns="$RHOAI_APP_NS"
+    maas_label_title="ModelsAsServiceReady"
+  fi
 
   local kuadrant_ready
   kuadrant_ready=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
@@ -644,18 +824,16 @@ print_summary() {
 
   echo
   echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${CYAN}║          RHOAI 3.4 MaaS — Configuration Summary              ║${NC}"
+  echo -e "${BOLD}${CYAN}║          RHOAI MaaS — Configuration Summary                  ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
   echo
   echo -e "  ${BOLD}Component${NC}                          ${BOLD}Status${NC}"
   echo -e "  ─────────────────────────────────────────────────────"
-  local maas_api_ready maas_gw_prog maas_ready
-  maas_api_ready=$(oc get pods -n "$RHOAI_APP_NS" -l "app.kubernetes.io/name=maas-api" \
+  local maas_api_ready maas_gw_prog
+  maas_api_ready=$(oc get pods -n "$maas_api_ns" -l "app.kubernetes.io/name=maas-api" \
     --field-selector=status.phase=Running 2>/dev/null | grep -c Running || echo 0)
   maas_gw_prog=$(oc get gateway maas-default-gateway -n openshift-ingress \
     -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || echo "N/A")
-  maas_ready=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
-    -o jsonpath='{.status.conditions[?(@.type=="ModelsAsServiceReady")].status}' 2>/dev/null || echo "N/A")
 
   echo -e "  cert-manager operator              $(oc get csv -n "$CERT_MANAGER_NS" 2>/dev/null | awk '/cert-manager/{print $NF}' | head -1 || echo 'N/A')"
   echo -e "  RHCL operator                      $(oc get csv -n openshift-operators 2>/dev/null | awk '/rhcl/{print $NF}' | head -1 || echo 'N/A')"
@@ -663,17 +841,26 @@ print_summary() {
   echo -e "  MaaS Gateway (openshift-ingress)   Programmed=${maas_gw_prog}"
   echo -e "  Authorino TLS                      $(oc get authorino authorino -n "$KUADRANT_NS" -o jsonpath='{.spec.listener.tls.enabled}' 2>/dev/null || echo 'N/A')"
   echo -e "  PostgreSQL (maas-db)               $(oc get pods -n maas-db -l app=maas-postgresql --field-selector=status.phase=Running 2>/dev/null | grep -c Running || echo 0) pod(s) Running"
-  echo -e "  maas-api                           ${maas_api_ready} pod(s) Running"
-  echo -e "  ModelsAsServiceReady               ${maas_ready}"
+  echo -e "  maas-api (${maas_api_ns})  ${maas_api_ready} pod(s) Running"
+  echo -e "  ${maas_label_title}    ${maas_ready}"
   echo -e "  modelsAsService                    ${maas_state}"
   local genai_studio
   genai_studio=$(oc get OdhDashboardConfig odh-dashboard-config -n "$RHOAI_APP_NS" \
     -o jsonpath='{.spec.dashboardConfig.genAiStudio}' 2>/dev/null || echo "N/A")
   echo -e "  GenAI Studio (OdhDashboardConfig)  ${genai_studio}"
-  local llamastack_state
-  llamastack_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
-    -o jsonpath='{.spec.components.llamastackoperator.managementState}' 2>/dev/null || echo "N/A")
-  echo -e "  llamastackoperator                 ${llamastack_state}"
+  if (( RHOAI_MAJOR > 3 || (RHOAI_MAJOR == 3 && RHOAI_MINOR >= 5) )); then
+    local ogx_state ogx_ready
+    ogx_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      -o jsonpath='{.spec.components.ogx.managementState}' 2>/dev/null || echo "N/A")
+    ogx_ready=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      -o jsonpath='{.status.conditions[?(@.type=="OGXReady")].status}' 2>/dev/null || echo "N/A")
+    echo -e "  ogx (Playground backend, 3.5+)     ${ogx_state} (OGXReady=${ogx_ready})"
+  else
+    local llamastack_state
+    llamastack_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      -o jsonpath='{.spec.components.llamastackoperator.managementState}' 2>/dev/null || echo "N/A")
+    echo -e "  llamastackoperator                 ${llamastack_state}"
+  fi
   echo -e "  GatewayConfig domain               ${domain}"
   echo -e "  Model namespace                    ${MAAS_MODEL_NS}"
   echo
@@ -739,10 +926,29 @@ main() {
   configure_authorino_tls   # Step 5
   deploy_postgresql          # Step 6
   configure_monitoring       # Step 7
-  enable_maas_in_dsc         # Step 8
+  # Step 8: spec.components.kserve.modelsAsService is deprecated starting RHOAI 3.5 in
+  # favor of spec.components.aigateway.modelsAsAService — see enable_maas_in_dsc_aigateway()
+  # for the field-mapping details. RHOAI_MAJOR/RHOAI_MINOR are set by check_prerequisites.
+  local rhoai_is_35_plus=false
+  (( RHOAI_MAJOR > 3 || (RHOAI_MAJOR == 3 && RHOAI_MINOR >= 5) )) && rhoai_is_35_plus=true
+
+  if [[ "$rhoai_is_35_plus" == "true" ]]; then
+    enable_maas_in_dsc_aigateway  # Step 8 (RHOAI 3.5+)
+  else
+    enable_maas_in_dsc            # Step 8 (RHOAI 3.4.x)
+  fi
+
   enable_genai_studio        # Step 9
-  enable_llamastack_operator # Step 10
-  verify_maas_components     # Step 11
+
+  # Step 10: LlamaStack (3.4.x) is fully replaced by OGX starting RHOAI 3.5EA1 — see
+  # ogx-migration.md.
+  if [[ "$rhoai_is_35_plus" == "true" ]]; then
+    enable_ogx_operator         # Step 10 (RHOAI 3.5+)
+  else
+    enable_llamastack_operator  # Step 10 (RHOAI 3.4.x)
+  fi
+
+  verify_maas_components "$rhoai_is_35_plus"    # Step 11
   create_model_namespace     # Step 12
 
   print_summary
