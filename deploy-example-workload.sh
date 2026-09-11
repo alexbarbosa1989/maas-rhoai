@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# deploy-example-workload.sh
-# Deploys the example MaaS workload on top of a platform already configured by
-# setup-maas.sh: an LLMInferenceService, MaaS governance (MaaSModelRef,
-# MaaSSubscription, MaaSAuthPolicy), and (optionally) a LlamaStackDistribution
-# for the RHOAI GenAI Playground.
+# deploy-basic-example-workload.sh
+# LLMInferenceService and its MaaS governance (MaaSModelRef, MaaSSubscription,
+# MaaSAuthPolicy) — nothing OGX-specific. Once the model is published to MaaS,
+# create the GenAI Playground from the RHOAI dashboard and let the platform
+# auto-provision its OGXServer (and, on 3.5, a companion pgvector RAG store);
+# see ./remove-ogx-playground.sh to tear that down again for repeat testing.
 #
 # This is a separate script from setup-maas.sh on purpose: the platform layer
 # (operators, gateway, Authorino TLS, DSC/dashboard flags) is close to one-shot,
@@ -11,10 +12,9 @@
 # tear down independently many times.
 #
 # Usage:
-#   ./deploy-example-workload.sh [--skip-llamastack] [--hardware-profile-name NAME] [--help]
+#   ./deploy-basic-example-workload.sh [--hardware-profile-name NAME] [--help]
 #
 # Options:
-#   --skip-llamastack            Skip deploying the LlamaStackDistribution (GenAI Playground)
 #   --hardware-profile-name NAME GPU HardwareProfile to use (overrides auto-detection)
 #   --help                       Show this message
 
@@ -31,7 +31,6 @@ MODEL_WAIT_TIMEOUT="${MODEL_WAIT_TIMEOUT:-600}"   # seconds
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFESTS_DIR="${SCRIPT_DIR}/manifests"
 
-SKIP_LLAMASTACK=false
 HARDWARE_PROFILE_NAME="${HARDWARE_PROFILE_NAME:-}"
 RESOLVED_HW_PROFILE=""
 
@@ -42,7 +41,6 @@ source "${SCRIPT_DIR}/lib/common.sh"
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --skip-llamastack) SKIP_LLAMASTACK=true; shift ;;
       --hardware-profile-name)
         if [[ $# -lt 2 ]]; then
           log_error "--hardware-profile-name requires a value"
@@ -52,14 +50,18 @@ parse_args() {
         shift 2 ;;
       --help)
         cat <<'USAGE'
-deploy-example-workload.sh — Deploys the example MaaS workload (model, MaaS governance,
-LlamaStack playground) on top of a platform configured by setup-maas.sh.
+deploy-basic-example-workload.sh — Deploys the example MaaS workload (model + MaaS governance
+only) on top of a platform configured by setup-maas.sh.
+
+This script deliberately does NOT create an OGXServer or GenAI Playground itself — create
+the Playground from the RHOAI dashboard once the model below is published, and the platform
+auto-provisions its OGXServer (RHOAI 3.5 also auto-provisions a companion pgvector RAG
+store). Use ./remove-ogx-playground.sh to tear that down again for repeat testing.
 
 Usage:
-  ./deploy-example-workload.sh [OPTIONS]
+  ./deploy-basic-example-workload.sh [OPTIONS]
 
 Options:
-  --skip-llamastack             Skip deploying the LlamaStackDistribution (GenAI Playground)
   --hardware-profile-name NAME  GPU HardwareProfile to annotate the LLMInferenceService with.
                                  Overrides auto-detection; use this if your cluster has no
                                  'local-gpu' HardwareProfile (the manifest's default) or you
@@ -70,7 +72,6 @@ Deploys, in order:
   1. LLMInferenceService 'llama-3-8b' (manifests/08)
   2. MaaSModelRef, MaaSSubscription, MaaSAuthPolicy (manifests/09-11) — publishes the
      model to MaaS and grants system:authenticated users a 100k-tokens/24h quota
-  3. LlamaStackDistribution for the GenAI Playground (manifests/13), unless --skip-llamastack
 
 Once published, the model is callable externally via the MaaS gateway at
 https://maas.<apps-domain>/maas-models/llama-3-8b/v1/chat/completions, authenticated with a
@@ -85,7 +86,8 @@ HardwareProfile resolution order for step 1 (opendatahub.io/hardware-profile-nam
 
 Prerequisites (created by setup-maas.sh):
   - Namespace 'maas-models' must exist
-  - DSC component kserve.modelsAsService must be Managed
+  - DSC component kserve.modelsAsService (3.4) or aigateway.modelsAsAService (3.5+) must
+    be Managed
 
 Environment variables (all optional, shown with defaults):
   RHOAI_APP_NS=redhat-ods-applications   MAAS_MODEL_NS=maas-models
@@ -119,14 +121,22 @@ check_prerequisites() {
     exit 1
   fi
 
-  local maas_state
-  maas_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+  # RHOAI 3.5 moved MaaS from kserve.modelsAsService to its own top-level
+  # aigateway.modelsAsAService component (field name confirmed as-is, double-A,
+  # via `oc get dsc -o json` on a live 3.5.0 cluster). Accept either so this
+  # script works against 3.4 (kserve.modelsAsService) and 3.5+ (aigateway).
+  local maas_state_kserve maas_state_aigateway
+  maas_state_kserve=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
     -o jsonpath='{.spec.components.kserve.modelsAsService.managementState}' 2>/dev/null)
-  if [[ "$maas_state" != "Managed" ]]; then
-    log_error "DSC '${DSC_NAME}' kserve.modelsAsService is '${maas_state:-unset}', not Managed. Run ./setup-maas.sh first."
+  maas_state_aigateway=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    -o jsonpath='{.spec.components.aigateway.modelsAsAService.managementState}' 2>/dev/null)
+  if [[ "$maas_state_kserve" != "Managed" && "$maas_state_aigateway" != "Managed" ]]; then
+    log_error "DSC '${DSC_NAME}' has neither kserve.modelsAsService nor aigateway.modelsAsAService"
+    log_error "set to Managed (kserve.modelsAsService='${maas_state_kserve:-unset}', aigateway.modelsAsAService='${maas_state_aigateway:-unset}')."
+    log_error "Run ./setup-maas.sh first."
     exit 1
   fi
-  log_ok "MaaS platform prerequisites satisfied."
+  log_ok "MaaS platform prerequisites satisfied (kserve.modelsAsService='${maas_state_kserve:-unset}', aigateway.modelsAsAService='${maas_state_aigateway:-unset}')."
 
   if [[ ! -d "$MANIFESTS_DIR" ]]; then
     log_error "Manifests directory not found: ${MANIFESTS_DIR}"
@@ -203,68 +213,6 @@ publish_maas_governance() {
   log_ok "MaaS governance published."
 }
 
-deploy_llamastack() {
-  if [[ "$SKIP_LLAMASTACK" == "true" ]]; then
-    log_step "Step 5: Deploying LlamaStack for the GenAI Playground"
-    log_warn "--skip-llamastack: skipping."
-    return 0
-  fi
-
-  log_step "Step 5: Deploying LlamaStack for the GenAI Playground"
-  log_info "The GenAI Playground talks to LlamaStack, not directly to the LLMInferenceService."
-
-  local apply_out
-  apply_out=$(apply_manifest "${MANIFESTS_DIR}/13-llamastack-distribution.yaml")
-  echo "$apply_out"
-
-  # LlamaStack reads its config at startup and does not hot-reload — if the ConfigMap
-  # content changed on an already-existing resource ("configured", not "created" or
-  # "unchanged"), the running pod is stale and won't pick up the new config until
-  # restarted.
-  if echo "$apply_out" | grep -q "^configmap/llama-stack-config configured"; then
-    log_info "llama-stack-config ConfigMap changed — restarting deployment to pick it up…"
-    oc rollout restart deployment/lsd-genai-playground -n "$MAAS_MODEL_NS" 2>&1
-
-    # On resource-constrained single-node clusters, maxUnavailable rounds to 0 for a
-    # 1-replica deployment, deadlocking the rollout: the new pod can't schedule while
-    # the old pod holds the CPU. Break the deadlock by deleting the old pod once a new
-    # one is Pending.
-    local deadline=$(( $(date +%s) + MODEL_WAIT_TIMEOUT ))
-    local deadlock_fix_applied=false
-    while true; do
-      if oc rollout status deployment/lsd-genai-playground -n "$MAAS_MODEL_NS" --timeout=5s 2>&1 \
-          | grep -q "successfully rolled out"; then
-        log_ok "LlamaStack deployment rolled out with updated config."
-        break
-      fi
-      if [[ "$deadlock_fix_applied" == "false" ]]; then
-        local pending_new running_old
-        pending_new=$(oc get pods -n "$MAAS_MODEL_NS" -l app=llama-stack 2>/dev/null | grep -c Pending || true)
-        running_old=$(oc get pods -n "$MAAS_MODEL_NS" -l app=llama-stack 2>/dev/null | grep -c Running || true)
-        if (( pending_new > 0 && running_old > 0 )); then
-          local old_pod
-          old_pod=$(oc get pods -n "$MAAS_MODEL_NS" -l app=llama-stack 2>/dev/null | awk '/Running/{print $1}' | head -1)
-          if [[ -n "$old_pod" ]]; then
-            log_warn "CPU deadlock detected (new pod Pending, old pod Running) — deleting old pod '${old_pod}' to free resources."
-            oc delete pod "$old_pod" -n "$MAAS_MODEL_NS" 2>&1
-            deadlock_fix_applied=true
-          fi
-        fi
-      fi
-      if (( $(date +%s) > deadline )); then
-        log_warn "Timed out waiting for LlamaStack rollout — check manually: oc get pods -n ${MAAS_MODEL_NS} -l app=llama-stack"
-        break
-      fi
-      sleep 5
-    done
-  else
-    wait_for_pods "$MAAS_MODEL_NS" "app=llama-stack" "$MODEL_WAIT_TIMEOUT" \
-      || log_warn "LlamaStack pod not confirmed Running — check manually: oc get pods -n ${MAAS_MODEL_NS} -l app=llama-stack"
-  fi
-
-  log_ok "LlamaStackDistribution applied."
-}
-
 print_summary() {
   log_step "Example workload deployment — Summary"
 
@@ -272,14 +220,11 @@ print_summary() {
   apps_domain=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null || echo "<apps-domain>")
   maas_url="https://maas.${apps_domain}"
 
-  local model_ready modelref_phase llamastack_state
+  local model_ready modelref_phase
   model_ready=$(oc get llminferenceservice llama-3-8b -n "$MAAS_MODEL_NS" \
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "N/A")
   modelref_phase=$(oc get maasmodelref llama-3-8b -n "$MAAS_MODEL_NS" \
     -o jsonpath='{.status.phase}' 2>/dev/null || echo "N/A")
-  llamastack_state="skipped"
-  [[ "$SKIP_LLAMASTACK" != "true" ]] && llamastack_state=$(oc get pods -n "$MAAS_MODEL_NS" -l app=llama-stack \
-    --field-selector=status.phase=Running 2>/dev/null | grep -c Running || echo 0)
 
   echo
   echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
@@ -290,17 +235,11 @@ print_summary() {
   echo -e "  HardwareProfile used                       ${RESOLVED_HW_PROFILE}"
   echo -e "  MaaSModelRef phase                         ${modelref_phase}"
   echo -e "  MaaSSubscription + MaaSAuthPolicy applied  (system:authenticated, 100k tokens/24h)"
-  if [[ "$SKIP_LLAMASTACK" == "true" ]]; then
-    echo -e "  LlamaStack (GenAI Playground)             skipped (--skip-llamastack)"
-  else
-    echo -e "  LlamaStack (GenAI Playground)              ${llamastack_state} pod(s) Running"
-  fi
   echo
   echo -e "  ${BOLD}Inspect resources:${NC}"
   echo -e "     oc get llminferenceservice -n ${MAAS_MODEL_NS}"
   echo -e "     oc get maasmodelref -n ${MAAS_MODEL_NS}"
   echo -e "     oc get maassubscription,maasauthpolicy -n models-as-a-service"
-  [[ "$SKIP_LLAMASTACK" != "true" ]] && echo -e "     oc get llamastackdistribution -n ${MAAS_MODEL_NS}"
   echo
   echo -e "  ${BOLD}Call the model API (mint a MaaS API key, then use it):${NC}"
   echo -e "     TOKEN=\$(oc whoami -t)"
@@ -311,10 +250,14 @@ print_summary() {
   echo -e "       ${maas_url}/${MAAS_MODEL_NS}/llama-3-8b/v1/chat/completions \\"
   echo -e "       -d '{\"model\":\"llama-3-8b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
   echo
+  echo -e "  ${BOLD}GenAI Playground:${NC} create it from the RHOAI dashboard now that the model is"
+  echo -e "  published — the platform auto-provisions its OGXServer (and, on 3.5, a companion"
+  echo -e "  pgvector RAG store). To tear that down again for repeat testing:"
+  echo -e "     ./remove-ogx-playground.sh ${MAAS_MODEL_NS}"
+  echo
   echo -e "  Re-run this script any time to reapply the workload (all steps are idempotent)."
   echo -e "  To remove it: oc delete -f manifests/08-example-llminferenceservice.yaml -f manifests/09-example-maas-modelref.yaml \\"
-  echo -e "                   -f manifests/10-example-maas-subscription.yaml -f manifests/11-example-maas-auth-policy.yaml \\"
-  echo -e "                   -f manifests/13-llamastack-distribution.yaml"
+  echo -e "                   -f manifests/10-example-maas-subscription.yaml -f manifests/11-example-maas-auth-policy.yaml"
   echo
 }
 
@@ -325,14 +268,13 @@ main() {
 
   echo
   echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${CYAN}║     RHOAI 3.4 MaaS — Example Workload Deployment             ║${NC}"
+  echo -e "${BOLD}${CYAN}║     RHOAI 3 MaaS — Example Workload Deployment              ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
   echo
 
   check_prerequisites
   deploy_llminferenceservice
   publish_maas_governance
-  deploy_llamastack
   print_summary
 }
 
