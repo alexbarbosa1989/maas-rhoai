@@ -904,7 +904,7 @@ main() {
 
   echo
   echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${CYAN}║     RHOAI 3.4 — Models-as-a-Service Automation Setup        ║${NC}"
+  echo -e "${BOLD}${CYAN}║     RHOAI 3 — Models-as-a-Service Automation Setup        ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
   echo
 
