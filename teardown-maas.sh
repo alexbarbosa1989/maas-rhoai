@@ -228,7 +228,7 @@ main() {
 
   echo
   echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${CYAN}║          RHOAI 3.4 MaaS — Teardown                          ║${NC}"
+  echo -e "${BOLD}${CYAN}║          RHOAI 3 MaaS — Teardown                          ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
   confirm
