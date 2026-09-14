@@ -397,6 +397,32 @@ EOF
     fi
     sleep 5
   done
+
+  # MaaSModelRef reaching Ready does NOT mean the MaaSSubscription's own rate-limiting
+  # policy has finished reconciling into Kuadrant yet — confirmed live: calling the Gateway
+  # immediately after this point can 403 with "subscription rate limiting policies are not
+  # ready" even though MaaSModelRef, ExternalProvider, and ExternalModel are all Ready.
+  # Wait for both the subscription's own Ready condition AND its per-model
+  # tokenRateLimitStatuses entry (the literal thing the 403 message refers to).
+  log_info "Waiting for MaaSSubscription '${SUBSCRIPTION_NAME}' to be Ready…"
+  local sub_deadline=$(( $(date +%s) + OPERATOR_WAIT_TIMEOUT ))
+  while true; do
+    local sub_ready trl_ready
+    sub_ready=$(oc get maassubscription "$SUBSCRIPTION_NAME" -n "$MAAS_GOVERNANCE_NS" \
+      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+    trl_ready=$(oc get maassubscription "$SUBSCRIPTION_NAME" -n "$MAAS_GOVERNANCE_NS" \
+      -o jsonpath="{.status.tokenRateLimitStatuses[?(@.model==\"${MODEL_NAME}\")].ready}" 2>/dev/null)
+    if [[ "$sub_ready" == "True" && "$trl_ready" == "true" ]]; then
+      log_ok "MaaSSubscription '${SUBSCRIPTION_NAME}' is Ready (rate limit policy accepted)."
+      break
+    fi
+    if (( $(date +%s) > sub_deadline )); then
+      log_error "MaaSSubscription never reached Ready (Ready='${sub_ready:-unknown}', tokenRateLimitReady='${trl_ready:-unknown}')."
+      oc get maassubscription "$SUBSCRIPTION_NAME" -n "$MAAS_GOVERNANCE_NS" -o yaml 2>/dev/null | tail -30
+      exit 1
+    fi
+    sleep 5
+  done
 }
 
 test_via_gateway() {
