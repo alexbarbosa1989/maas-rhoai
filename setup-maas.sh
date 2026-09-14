@@ -549,10 +549,16 @@ label_gateway_namespaces() {
   oc label namespace "$RHOAI_APP_NS" maas.opendatahub.io/gateway-access="true" --overwrite &>/dev/null
   log_ok "Namespace '${RHOAI_APP_NS}' labeled maas.opendatahub.io/gateway-access=true."
 
-  for ns in "${EXTRA_GATEWAY_NAMESPACES[@]}"; do
-    oc label namespace "$ns" maas.opendatahub.io/gateway-access="true" --overwrite &>/dev/null
-    log_ok "Namespace '${ns}' labeled maas.opendatahub.io/gateway-access=true."
-  done
+  # Guarded on length, not a bare "${arr[@]}" expansion: on bash < 4.4, expanding an
+  # empty array under `set -u` throws "unbound variable" even though it was declared
+  # (EXTRA_GATEWAY_NAMESPACES=()) — fixed upstream in bash 4.4, but confirmed to still
+  # bite on older bash (e.g. RHEL 7/8 bastion hosts, macOS's stock /bin/bash 3.2).
+  if (( ${#EXTRA_GATEWAY_NAMESPACES[@]} > 0 )); then
+    for ns in "${EXTRA_GATEWAY_NAMESPACES[@]}"; do
+      oc label namespace "$ns" maas.opendatahub.io/gateway-access="true" --overwrite &>/dev/null
+      log_ok "Namespace '${ns}' labeled maas.opendatahub.io/gateway-access=true."
+    done
+  fi
 }
 
 create_passthrough_route() {
