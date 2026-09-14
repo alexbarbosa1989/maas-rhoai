@@ -1,0 +1,12 @@
+# Source: https://github.com/rh-aiservices-bu/rhoai-maas-guide/blob/main/manifests/02-platform-config/gatewayclass.yaml
+#
+# Registers OpenShift's own built-in Gateway API implementation as a GatewayClass. This is
+# a different controller/GatewayClass than RHOAI's own data-science-gateway-class (used by
+# setup-maas.sh) — same underlying controllerName, but a separate GatewayClass object this
+# script owns, not something the RHOAI operator creates.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: openshift-default
+spec:
+  controllerName: "openshift.io/gateway-controller/v1"

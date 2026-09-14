@@ -1,0 +1,31 @@
+# Templated — setup-maas.sh substitutes METALLB_IP_RANGE_PLACEHOLDER before applying.
+#
+# Default range derivation follows the rh-aiservices-bu rhoai-maas-guide's own formula
+# exactly (01-prerequisites.html, "MetalLB Operator (Non-Cloud Clusters)"): the first
+# node's own InternalIP + 1 on the last octet, used as a single-address pool. This works
+# identically for a single-node cluster (CRC, SNO) and for any real multi-node bare-metal
+# cluster, since it only depends on nodes[0]'s own address — no cluster-topology-specific
+# logic needed. The guide's own warning applies here too: never reuse the node's own IP,
+# and on a more complex network, override with --metallb-ip-range / METALLB_IP_RANGE to a
+# genuinely free address on the same L2 subnet instead of trusting the derived default.
+#
+# L2Advertisement (ARP-based), not BGP — the right default for a cluster with no existing
+# BGP peering infrastructure (CRC, most on-prem/SNO setups). Use a BGPAdvertisement +
+# BGPPeer instead if your network already runs BGP to the cluster's nodes.
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: maas-gateway-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - METALLB_IP_RANGE_PLACEHOLDER
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: maas-gateway-pool
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - maas-gateway-pool

@@ -1,0 +1,51 @@
+# Source: https://github.com/rh-aiservices-bu/rhoai-maas-guide/blob/main/manifests/02-platform-config/gateway.yaml.tmpl
+#
+# Templated — setup-maas.sh substitutes CLUSTER_DOMAIN_PLACEHOLDER and
+# CERT_NAME_PLACEHOLDER before applying. Do not apply this file directly with oc apply.
+#
+# NOTE: the upstream guide's own envsubst command only substitutes ${CLUSTER_DOMAIN} and
+# ${CERT_NAME} — matching what's templated here. TLS reuses the cluster's existing default
+# ingress certificate (CERT_NAME, resolved by the script from the IngressController) rather
+# than minting a new service-ca cert, which is why this file has no accompanying ConfigMap
+# for a serving-cert-secret-name annotation the way manifests/06b-maas-gateway-configmap.yaml
+# does for the data-science-gateway-class path.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: maas-default-gateway
+  namespace: openshift-ingress
+  annotations:
+    opendatahub.io/managed: "false"
+    security.opendatahub.io/authorino-tls-bootstrap: "true"
+spec:
+  gatewayClassName: openshift-default
+  infrastructure:
+    parametersRef:
+      group: ""
+      kind: ConfigMap
+      name: maas-gateway-options
+  listeners:
+    # HTTPS only, deliberately — see KCS-GATEWAY-DUAL-LISTENER-ENDPOINT-SCHEME.md. A
+    # second HTTP listener bound to this same hostname (the upstream guide's own manifest
+    # shape) reproduces a confirmed dashboard bug: LLMInferenceService's status-address
+    # reconciliation produces one duplicate-named address entry per matching listener, and
+    # whatever collapses that into status.url picks the http:// one — so the dashboard's
+    # Endpoints dialog shows an http:// URL for a route that's actually TLS-only. Do not
+    # add an HTTP listener here; if HTTP must be exposed for something unrelated, use a
+    # different hostname so it doesn't collide with this one.
+    - name: https
+      hostname: maas.CLUSTER_DOMAIN_PLACEHOLDER
+      port: 443
+      protocol: HTTPS
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              maas.opendatahub.io/gateway-access: "true"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - group: ""
+            kind: Secret
+            name: CERT_NAME_PLACEHOLDER

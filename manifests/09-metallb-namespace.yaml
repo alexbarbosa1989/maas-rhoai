@@ -1,0 +1,37 @@
+# Standard MetalLB operator install (Red Hat catalog) — non-cloud platforms only. Not
+# sourced from the rh-aiservices-bu guide's own kustomize bundle (that one isn't public as
+# individual files); this follows the same well-known install shape as every other operator
+# in this repo (namespace + OperatorGroup + Subscription from redhat-operators).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: metallb-system
+  labels:
+    openshift.io/cluster-monitoring: "true"
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: metallb-operator
+  namespace: metallb-system
+spec: {}
+# No targetNamespaces: the metallb-operator CSV only supports the AllNamespaces
+# install mode (confirmed live — OwnNamespace/SingleNamespace/MultiNamespace are
+# all `"supported": false` in spec.installModes). Setting targetNamespaces here
+# makes OLM pick OwnNamespace instead, which the CSV rejects outright:
+# reason: UnsupportedOperatorGroup, message: "OwnNamespace InstallModeType not
+# supported, cannot configure to watch own namespace" — CSV goes straight to
+# Failed and never recovers, so the empty-namespaces (AllNamespaces) form here
+# is required, not optional.
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: metallb-operator
+  namespace: metallb-system
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: metallb-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace

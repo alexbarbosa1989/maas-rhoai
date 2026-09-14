@@ -1,0 +1,12 @@
+# Source: https://github.com/rh-aiservices-bu/rhoai-maas-guide/blob/main/manifests/02-platform-config/kuadrant/kuadrant.yaml
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: kuadrant-system
+spec:
+  # Enable observability so the Kuadrant operator creates its own Limitador/Authorino
+  # PodMonitor/ServiceMonitor resources, scraped by user-workload monitoring. Required
+  # for MaaS observability/showback dashboards.
+  observability:
+    enable: true

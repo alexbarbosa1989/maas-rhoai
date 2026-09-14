@@ -1,0 +1,27 @@
+# Source: https://github.com/rh-aiservices-bu/rhoai-maas-guide/blob/main/manifests/02-platform-config/kuadrant/service-annotation.yaml
+#
+# Re-applies the authorino-authorino-authorization Service (normally created by the RHCL
+# operator) with a service.beta.openshift.io/serving-cert-secret-name annotation added, so
+# OpenShift's service-ca operator mints authorino-server-cert automatically. This is the
+# same outcome our own manifests reach via `oc annotate` on the existing Service — this repo
+# reaches it by re-applying the full Service object instead, matching the upstream guide.
+apiVersion: v1
+kind: Service
+metadata:
+  name: authorino-authorino-authorization
+  namespace: kuadrant-system
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: authorino-server-cert
+spec:
+  ports:
+    - name: grpc
+      port: 50051
+      protocol: TCP
+      targetPort: 50051
+    - name: http
+      port: 5001
+      protocol: TCP
+      targetPort: 5001
+  selector:
+    authorino-resource: authorino
+  type: ClusterIP

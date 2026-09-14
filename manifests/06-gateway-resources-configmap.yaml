@@ -1,0 +1,25 @@
+# Source: https://github.com/rh-aiservices-bu/rhoai-maas-guide/blob/main/manifests/02-platform-config/gateway-resources.yaml
+#
+# Referenced by the Gateway's spec.infrastructure.parametersRef. Raises the istio-proxy
+# container's memory limit from the GatewayClass controller's 1Gi default to 2Gi — without
+# this, the gateway pod can OOMKill once Kuadrant's Wasm extensions (rate limiting, auth)
+# load onto it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maas-gateway-options
+  namespace: openshift-ingress
+data:
+  deployment: |
+    spec:
+      template:
+        spec:
+          containers:
+          - name: istio-proxy
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+              limits:
+                cpu: "2"
+                memory: 2Gi

@@ -1,0 +1,5 @@
+# Source: https://github.com/rh-aiservices-bu/rhoai-maas-guide/blob/main/manifests/02-platform-config/kuadrant/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kuadrant-system

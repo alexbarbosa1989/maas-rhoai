@@ -42,10 +42,13 @@ Usage:
   ./teardown-maas.sh [--full] [--yes]
 
 Options:
-  --full  Also uninstall cert-manager and RHCL/Kuadrant operators
-          (Subscriptions, CSVs, OperatorGroups, namespaces)
+  --full  Also uninstall cert-manager, RHCL/Kuadrant, the openshift-default GatewayClass,
+          and MetalLB (Subscriptions, CSVs, OperatorGroups, namespaces)
   --yes   Skip the confirmation prompt
   --help  Show this message
+
+RHOAI version is auto-detected from the rhods-operator CSV, same as setup-maas.sh, and
+determines which DSC fields get reverted below (3.4.x vs 3.5+ differ in field names).
 
 Without --full the following are removed:
   - All LlamaStackDistribution, LLMInferenceService, and MaaSModelRef in maas-models
@@ -54,15 +57,23 @@ Without --full the following are removed:
   - MaaSSubscription 'llama-3-8b-free' and MaaSAuthPolicy 'llama-3-8b-access'
     in models-as-a-service (the namespace itself is left in place — it's owned by RHOAI)
   - maas-api RBAC workaround (Role/RoleBinding/ClusterRole/ClusterRoleBinding) for the
-    maas-api/maas-controller image version-skew bug
+    maas-api/maas-controller image version-skew bug (RHOAI 3.4.x only; no-op on 3.5+)
   - Namespace maas-models
-  - DSC reverted (modelsAsService: Removed)
-  - DSC llamastackoperator reverted (Removed) — only if no LlamaStackDistribution
-    resources remain anywhere on the cluster (it's cluster-scoped and may be
-    used outside MaaS)
-  - Gateway maas-default-gateway and its external Route (openshift-ingress)
+  - DSC MaaS setting reverted: modelsAsService (3.4.x) or aigateway/modelsAsAService (3.5+)
+  - genAiStudio reverted to false in OdhDashboardConfig
+  - DSC Playground backend reverted (Removed): llamastackoperator (3.4.x) or ogx (3.5+)
+    — only if no LlamaStackDistribution/OGXServer resources remain anywhere on the
+    cluster (both are cluster-scoped and may be used outside MaaS)
+  - Gateway maas-default-gateway, its Route (maas-default-gateway-https), and its
+    ConfigMap (maas-gateway-options), all in openshift-ingress
   - Authorino TLS patch reverted; Certificate + ClusterIssuer deleted
   - PostgreSQL (maas-db namespace + maas-db-config Secret)
+
+Only with --full:
+  - cert-manager and RHCL/Kuadrant operators
+  - openshift-default GatewayClass
+  - MetalLB (IPAddressPool/L2Advertisement, MetalLB CR, operator) — harmless no-op on
+    cloud platforms, where it was never installed
 
 Not removed in either mode:
   - RHOAI operator and DataScienceCluster (pre-existing)
@@ -75,6 +86,33 @@ USAGE
   done
 }
 
+# ─── Version detection ─────────────────────────────────────────────────────────
+# Mirrors setup-maas.sh's check_prerequisites() detection exactly, so revert_dsc() and
+# revert_llamastack_or_ogx() branch on the same RHOAI_MAJOR/RHOAI_MINOR the setup script
+# used to decide which fields to set in the first place (kserve.modelsAsService vs
+# aigateway.modelsAsAService, llamastackoperator vs ogx). Global (not local) on purpose —
+# read by every revert_* function below.
+detect_rhoai_version() {
+  local rhoai_csv rhoai_version
+  rhoai_csv=$(oc get csv -n "$RHOAI_OPERATOR_NS" 2>/dev/null \
+    | awk '/rhods-operator/{print $1}' | head -1)
+  if [[ -z "$rhoai_csv" ]]; then
+    log_warn "RHOAI operator CSV not found in '${RHOAI_OPERATOR_NS}' — cannot detect version."
+    log_warn "Assuming RHOAI >= 3.5 (aigateway/ogx fields) for DSC reverts; adjust manually if wrong."
+    RHOAI_MAJOR=3
+    RHOAI_MINOR=5
+    return 0
+  fi
+  rhoai_version=$(echo "$rhoai_csv" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+  RHOAI_MAJOR=$(echo "$rhoai_version" | cut -d. -f1)
+  RHOAI_MINOR=$(echo "$rhoai_version" | cut -d. -f2)
+  log_ok "Detected RHOAI ${rhoai_version} (${rhoai_csv})."
+}
+
+rhoai_is_35_plus() {
+  (( RHOAI_MAJOR > 3 || (RHOAI_MAJOR == 3 && RHOAI_MINOR >= 5) ))
+}
+
 # ─── Confirmation ─────────────────────────────────────────────────────────────
 confirm() {
   if [[ "$YES" == "true" ]]; then return 0; fi
@@ -83,7 +121,7 @@ confirm() {
   echo -e "  Cluster : $(oc whoami --show-server 2>/dev/null || echo '<unknown>')"
   echo -e "  User    : $(oc whoami 2>/dev/null || echo '<unknown>')"
   if [[ "$FULL" == "true" ]]; then
-    echo -e "  ${RED}--full: cert-manager and RHCL operators will also be uninstalled.${NC}"
+    echo -e "  ${RED}--full: cert-manager, RHCL, GatewayClass, and MetalLB will also be uninstalled.${NC}"
   fi
   echo
   read -rp "Type 'yes' to continue: " answer
@@ -137,11 +175,41 @@ revert_dsc() {
     log_warn "DSC '${DSC_NAME}' not found — skipping."
     return 0
   fi
-  oc patch dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
-    --type=merge \
-    -p '{"spec":{"components":{"kserve":{"modelsAsService":{"managementState":"Removed"}}}}}' \
-    || log_warn "Could not patch DSC — check manually."
-  log_ok "DataScienceCluster modelsAsService set to Removed."
+
+  if rhoai_is_35_plus; then
+    # RHOAI 3.5+: MaaS lives under spec.components.aigateway.modelsAsAService (double-A),
+    # gated by the PARENT aigateway.managementState — setup-maas.sh's
+    # enable_maas_in_dsc_aigateway() sets both together, so revert both together too;
+    # nothing else in this repo's flow depends on aigateway being Managed independent of
+    # MaaS. kserve.modelsAsService (the 3.4.x field, preserved on the CRD through 3.6) is
+    # left alone here — it was never set by this codebase's 3.5+ path.
+    oc patch dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      --type=merge \
+      -p '{"spec":{"components":{"aigateway":{"managementState":"Removed","modelsAsAService":{"managementState":"Removed"}}}}}' \
+      || log_warn "Could not patch DSC — check manually."
+    log_ok "DataScienceCluster aigateway/modelsAsAService set to Removed."
+  else
+    # RHOAI 3.4.x: spec.components.kserve.modelsAsService. Its CEL rule is one-directional
+    # (Managed→Removed allowed, Removed→Managed blocked) — reverting here is safe and is
+    # exactly the direction the rule permits.
+    oc patch dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+      --type=merge \
+      -p '{"spec":{"components":{"kserve":{"modelsAsService":{"managementState":"Removed"}}}}}' \
+      || log_warn "Could not patch DSC — check manually."
+    log_ok "DataScienceCluster modelsAsService set to Removed."
+  fi
+}
+
+revert_genai_studio() {
+  log_step "Reverting GenAI Studio flag in OdhDashboardConfig"
+  if ! oc get OdhDashboardConfig odh-dashboard-config -n "$RHOAI_APP_NS" &>/dev/null; then
+    log_warn "OdhDashboardConfig 'odh-dashboard-config' not found — skipping."
+    return 0
+  fi
+  oc patch OdhDashboardConfig odh-dashboard-config -n "$RHOAI_APP_NS" \
+    --type=merge --patch='{"spec":{"dashboardConfig":{"genAiStudio": false}}}' \
+    || log_warn "Could not patch OdhDashboardConfig — check manually."
+  log_ok "genAiStudio set to false in OdhDashboardConfig."
 }
 
 revert_llamastack_operator() {
@@ -165,12 +233,53 @@ revert_llamastack_operator() {
   log_ok "DataScienceCluster llamastackoperator set to Removed."
 }
 
+revert_ogx_operator() {
+  log_step "Reverting DataScienceCluster ogx setting (RHOAI 3.5+ Playground backend)"
+  if ! oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" &>/dev/null; then
+    log_warn "DSC '${DSC_NAME}' not found — skipping."
+    return 0
+  fi
+  # Same guard as llamastackoperator above, mirrored for OGX's own workload CR
+  # (ogxserver.ogx.io, cluster-scoped) — don't disable the operator out from under a
+  # server that isn't MaaS's.
+  local remaining
+  remaining=$(oc get ogxserver -A --no-headers 2>/dev/null | wc -l)
+  if (( remaining > 0 )); then
+    log_warn "${remaining} OGXServer resource(s) still exist cluster-wide — leaving ogx Managed."
+    return 0
+  fi
+  oc patch dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
+    --type=merge \
+    -p '{"spec":{"components":{"ogx":{"managementState":"Removed"}}}}' \
+    || log_warn "Could not patch DSC — check manually."
+  log_ok "DataScienceCluster ogx set to Removed."
+}
+
 delete_maas_gateway() {
   log_step "Deleting MaaS gateway"
-  oc delete route maas-default-gateway -n openshift-ingress --ignore-not-found 2>/dev/null || true
+  oc delete route maas-default-gateway-https -n openshift-ingress --ignore-not-found 2>/dev/null || true
   oc delete gateway maas-default-gateway -n openshift-ingress --ignore-not-found 2>/dev/null || true
-  oc delete configmap maas-default-gateway-config -n openshift-ingress --ignore-not-found 2>/dev/null || true
-  log_ok "Gateway 'maas-default-gateway' and its Route deleted."
+  oc delete configmap maas-gateway-options -n openshift-ingress --ignore-not-found 2>/dev/null || true
+  log_ok "Gateway 'maas-default-gateway' and its Route/ConfigMap deleted."
+}
+
+delete_gatewayclass() {
+  log_step "Removing openshift-default GatewayClass"
+  oc delete gatewayclass openshift-default --ignore-not-found 2>/dev/null || true
+  log_ok "GatewayClass 'openshift-default' removed."
+}
+
+delete_metallb() {
+  log_step "Removing MetalLB (non-cloud platforms only — no-op if never installed)"
+  oc delete l2advertisement maas-gateway-pool -n metallb-system --ignore-not-found 2>/dev/null || true
+  oc delete ipaddresspool maas-gateway-pool -n metallb-system --ignore-not-found 2>/dev/null || true
+  oc delete metallb metallb -n metallb-system --ignore-not-found 2>/dev/null || true
+  local csv
+  csv=$(oc get csv -n metallb-system 2>/dev/null | awk '/metallb-operator/{print $1}' | head -1)
+  [[ -n "$csv" ]] && oc delete csv "$csv" -n metallb-system --ignore-not-found 2>/dev/null || true
+  oc delete subscription metallb-operator -n metallb-system --ignore-not-found 2>/dev/null || true
+  oc delete namespace metallb-system --ignore-not-found 2>/dev/null || true
+  log_ok "MetalLB removed."
 }
 
 revert_authorino_tls() {
@@ -228,15 +337,21 @@ main() {
 
   echo
   echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${CYAN}║          RHOAI 3 MaaS — Teardown                          ║${NC}"
+  echo -e "${BOLD}${CYAN}║          RHOAI MaaS — Teardown                              ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
+  detect_rhoai_version
   confirm
 
   delete_model_workloads   # delete workloads before reverting DSC so controller can clean up
   delete_maas_api_rbac_workaround
   revert_dsc
-  revert_llamastack_operator
+  revert_genai_studio
+  if rhoai_is_35_plus; then
+    revert_ogx_operator
+  else
+    revert_llamastack_operator
+  fi
   delete_maas_gateway
   revert_authorino_tls
   delete_postgresql
@@ -244,6 +359,8 @@ main() {
   if [[ "$FULL" == "true" ]]; then
     delete_cert_manager
     delete_rhcl
+    delete_gatewayclass
+    delete_metallb
   fi
 
   echo

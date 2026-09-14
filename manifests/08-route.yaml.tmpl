@@ -1,0 +1,28 @@
+# Source: https://github.com/rh-aiservices-bu/rhoai-maas-guide/blob/main/manifests/03-maas-platform/openshift-gateway-setup/route.yaml.tmpl
+#
+# Non-cloud platforms only (None/BareMetal/OpenStack/VSphere/...). On cloud platforms
+# (AWS/Azure/GCP/IBMCloud) the openshift-default GatewayClass provisions a real
+# LoadBalancer Service directly and no Route is needed at all — unlike this repo's
+# data-science-gateway-class path (manifests/06c-maas-gateway.yaml), which is ClusterIP-only
+# and always needs a Route (manifests/06g-maas-gateway-route.yaml).
+#
+# passthrough (not reencrypt/edge) because the Gateway itself terminates TLS — the Route
+# just forwards the raw TLS bytes to the Gateway's Service.
+#
+# Templated — setup-maas.sh substitutes CLUSTER_DOMAIN_PLACEHOLDER before applying.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: maas-default-gateway-https
+  namespace: openshift-ingress
+spec:
+  host: maas.CLUSTER_DOMAIN_PLACEHOLDER
+  to:
+    kind: Service
+    name: maas-default-gateway-openshift-default
+    weight: 100
+  port:
+    targetPort: https
+  tls:
+    termination: passthrough
+    insecureEdgeTerminationPolicy: Redirect

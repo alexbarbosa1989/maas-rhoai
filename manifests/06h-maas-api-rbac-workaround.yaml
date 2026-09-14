@@ -8,6 +8,8 @@
 # blocks ModelsAsServiceReady) and apiservers.config.openshift.io (cluster-scoped, non-fatal —
 # maas-api falls back to a default Intermediate TLS profile without it).
 # Remove this manifest once maas-controller's RBAC template includes these natively upstream.
+# RHOAI 3.4.x only — setup-maas.sh gates this behind a version check before applying it,
+# since maas-api's ServiceAccount moves out of redhat-ods-applications on 3.5+.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

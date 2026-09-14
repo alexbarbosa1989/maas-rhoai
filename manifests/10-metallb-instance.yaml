@@ -1,0 +1,6 @@
+# Deploys the MetalLB controller + per-node speaker pods.
+apiVersion: metallb.io/v1beta1
+kind: MetalLB
+metadata:
+  name: metallb
+  namespace: metallb-system

@@ -5,7 +5,8 @@
 # Prerequisites:
 #   - GPU node with FP8 support (NVIDIA H100/H200 recommended)
 #   - Global pull secret must include registry.redhat.io credentials (standard on OCP/ROSA)
-#   - MaaS enabled in the DataScienceCluster (modelsAsService: Managed)
+#   - MaaS enabled in the DataScienceCluster (aigateway.modelsAsAService: Managed on 3.5+,
+#     kserve.modelsAsService: Managed on 3.4.x)
 #   - Gateway maas-default-gateway present in openshift-ingress (created by setup-maas.sh)
 #
 # Before applying, set the hardware profile annotation to your cluster's GPU profile:
