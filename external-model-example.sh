@@ -75,7 +75,7 @@ EXTERNAL_MODEL_NS="${EXTERNAL_MODEL_NS:-maas-models}"
 PROVIDER_NAME="${PROVIDER_NAME:-openai}"
 MODEL_NAME="${MODEL_NAME:-gpt-5}"
 SECRET_NAME="${SECRET_NAME:-openai-api-key}"
-SUBSCRIPTION_NAME="${SUBSCRIPTION_NAME:-${PROVIDER_NAME}-free}"
+SUBSCRIPTION_NAME="${SUBSCRIPTION_NAME:-${PROVIDER_NAME}-subs}"
 TOKEN_RATE_LIMIT="${TOKEN_RATE_LIMIT:-10000}"
 TOKEN_RATE_WINDOW="${TOKEN_RATE_WINDOW:-24h}"
 
@@ -125,7 +125,7 @@ through the Gateway with a minted API key.
 Environment variables (all optional except OPENAI_API_KEY, shown with defaults):
   OPENAI_API_KEY=<required unless --existing-secret>
   EXTERNAL_MODEL_NS=maas-models        PROVIDER_NAME=openai   MODEL_NAME=gpt-5
-  SECRET_NAME=openai-api-key          SUBSCRIPTION_NAME=openai-free
+  SECRET_NAME=openai-api-key          SUBSCRIPTION_NAME=openai-subs
   TOKEN_RATE_LIMIT=10000              TOKEN_RATE_WINDOW=24h
 USAGE
         exit 0 ;;
@@ -258,12 +258,9 @@ create_namespace() {
     log_ok "Namespace '${EXTERNAL_MODEL_NS}' created."
   fi
 
-  # maas-gateway-access=true is what THIS repo's Gateway (setup-maas.sh's
-  # configure_maas_gateway) actually checks via its Selector-based allowedRoutes — confirmed
-  # live. The companion guide's own doc names a different label
-  # (maas.opendatahub.io/gateway-access=true); applied too, harmlessly, in case some other
-  # controller checks for it, but maas-gateway-access=true is the one proven to matter here.
-  oc label namespace "$EXTERNAL_MODEL_NS" maas-gateway-access="true" --overwrite &>/dev/null
+  # maas.opendatahub.io/gateway-access=true is what this repo's Gateway (setup-maas.sh's
+  # configure_maas_gateway, manifests/07-gateway.yaml.tmpl) checks via its Selector-based
+  # allowedRoutes — confirmed live.
   oc label namespace "$EXTERNAL_MODEL_NS" maas.opendatahub.io/gateway-access="true" --overwrite &>/dev/null
   log_ok "Namespace '${EXTERNAL_MODEL_NS}' labeled for Gateway access."
 }
