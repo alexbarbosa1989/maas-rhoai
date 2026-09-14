@@ -6,8 +6,7 @@
 # ingress TLS cert). This is the only supported MaaS setup procedure in this repo — an
 # earlier ClusterIP+Route/data-science-gateway-class approach was retired because its
 # Gateway listener could never expose a real external hostname, which permanently broke the
-# dashboard's AI Hub page (see KCS-MAAS-INSTALLATION-SETUP.md, kept for historical
-# reference only — do not follow it on a current checkout of this repo).
+# dashboard's AI Hub page.
 #
 # CONFIRMED LIVE (RHOAI 3.5.0, ROSA + CRC): maas-api's tenant/hostname-resolution endpoint
 # (/maas-api/v1/tenants — what the dashboard's AI Hub / "AI asset endpoints" page depends
@@ -140,8 +139,7 @@ User Workload Monitoring, MetalLB (non-cloud platforms only — skipped entirely
 AWS/Azure/GCP/IBM Cloud), openshift-default GatewayClass, the MaaS Gateway (+ passthrough
 Route on non-cloud platforms), PostgreSQL, DSC modelsAsService/aigateway enablement,
 GenAI Studio + OGX/LlamaStack dashboard flags, component verification, and the MaaS model
-namespace. Does not deploy any model — run deploy-example-workload.sh or
-deploy-basic-example-workload.sh afterwards.
+namespace. Does not deploy any model — run deploy-example-workload.sh afterwards.
 
 Platform (cloud vs. non-cloud) is auto-detected via
 `oc get infrastructure cluster -o jsonpath='{.status.platform}'` — never prompted for.
@@ -810,8 +808,8 @@ enable_genai_studio() {
 
 enable_llamastack_operator() {
   log_step "Step 15: Enabling LlamaStack operator in the DataScienceCluster (required for GenAI Playground)"
-  # RHOAI 3.4.x only — LlamaStack is replaced by OGX starting 3.5EA1 (see ogx-migration.md
-  # and enable_ogx_operator() below).
+  # RHOAI 3.4.x only — LlamaStack is replaced by OGX starting 3.5EA1 (see
+  # enable_ogx_operator() below).
 
   local current_state
   current_state=$(oc get dsc "$DSC_NAME" -n "$RHOAI_OPERATOR_NS" \
@@ -1023,11 +1021,7 @@ print_summary() {
   echo
   echo -e "  ${BOLD}Next steps:${NC}"
   echo -e "  1. Deploy the example model and MaaS governance:"
-  if [[ "$rhoai_is_35_plus" == "true" ]]; then
-    echo -e "     ./deploy-basic-example-workload.sh"
-  else
-    echo -e "     ./deploy-example-workload.sh"
-  fi
+  echo -e "     ./deploy-example-workload.sh"
   echo
   echo -e "  2. Users mint a MaaS API key, then call the model through it:"
   echo -e "     TOKEN=\$(oc whoami -t)"

@@ -103,8 +103,8 @@ oc login https://api.<cluster>.<domain>:443 \
 # 3. Run the automation (installs everything end-to-end, including MetalLB on non-cloud)
 ./setup-maas.sh
 
-# 4. Optionally deploy the example LLMInferenceService, MaaS governance
-#    (MaaSModelRef/MaaSSubscription/MaaSAuthPolicy), and GenAI Playground backend
+# 4. Optionally deploy the example LLMInferenceService and MaaS governance
+#    (MaaSModelRef/MaaSSubscription/MaaSAuthPolicy)
 ./deploy-example-workload.sh
 ```
 
@@ -127,7 +127,6 @@ oc login https://api.<cluster>.<domain>:443 \
 
 | Flag | Description |
 |---|---|
-| `--skip-llamastack` | Skip deploying the LlamaStackDistribution (GenAI Playground, 3.4.x) |
 | `--hardware-profile-name NAME` | GPU HardwareProfile to annotate the LLMInferenceService with (overrides auto-detection) |
 | `--help` | Show usage |
 
@@ -178,9 +177,10 @@ always automatic — read from `oc get infrastructure cluster -o jsonpath='{.sta
 ```
 maas-rhoai/
 ├── setup-maas.sh                              # Platform bootstrap (operators, gateway, MetalLB, DSC, dashboard flags)
-├── deploy-example-workload.sh                 # Example model, MaaS governance (ModelRef/Subscription/AuthPolicy), LlamaStack playground
+├── deploy-example-workload.sh                 # Example model + MaaS governance (ModelRef/Subscription/AuthPolicy)
 ├── external-model-example.sh                  # Configures a MaaS-governed EXTERNAL model (e.g. GPT-5/OpenAI), RHOAI 3.5+
 ├── teardown-maas.sh                           # Removes everything the above create
+├── maas-observability/                        # Optional: usage/showback dashboard add-on — see maas-observability/README.md
 ├── README.md                                  # This file
 ├── TEARDOWN-README.md                         # Detailed teardown reference (flags, removal tables, manual cleanup recipes)
 ├── lib/
@@ -418,6 +418,15 @@ With `--full`, cert-manager, RHCL/Kuadrant, the `openshift-default` GatewayClass
 
 ---
 
+## Optional: usage/showback dashboard
+
+`maas-observability/` is a separately-lifecycled add-on (Technology Preview) that enables the
+RHOAI dashboard's per-user/subscription/model token-usage and rate-limit dashboard, on top of
+an already-running base platform. Not required for MaaS itself — see
+[maas-observability/README.md](maas-observability/README.md) for setup and details.
+
+---
+
 ## Troubleshooting
 
 ### Gateway stuck `Programmed: False` on a non-cloud platform
@@ -484,9 +493,16 @@ hostname as the `HTTPS` one.
 ### GenAI Playground chat fails with "Server disconnected without sending a response"
 `LLMInferenceService` workload pods always serve TLS on port 8000, but a
 `LlamaStackDistribution` created through the RHOAI **dashboard** generates its vLLM provider
-`base_url` with `http://`, causing every inference call to fail. `manifests/13-llamastack-distribution.yaml`
-already uses `https://`, so this shouldn't happen via `./deploy-example-workload.sh`. If you
-hit it on a dashboard-created LlamaStack instance, run `./fix-lsd-genai-playground.sh [NAMESPACE] [LSD_NAME]`.
+`base_url` with `http://`, causing every inference call to fail. Fix: change `base_url` from
+`http://` to `https://` in the LlamaStack instance's `llama-stack-config` ConfigMap, then
+restart its deployment:
+```bash
+oc get configmap llama-stack-config -n maas-models -o jsonpath='{.data.config\.yaml}' \
+  | sed 's|base_url: http://|base_url: https://|g' > /tmp/llama-stack-config-fixed.yaml
+oc create configmap llama-stack-config -n maas-models \
+  --from-file=config.yaml=/tmp/llama-stack-config-fixed.yaml --dry-run=client -o yaml | oc apply -f -
+oc rollout restart deployment/lsd-genai-playground -n maas-models
+```
 
 ### Check all MaaS component status at once
 ```bash

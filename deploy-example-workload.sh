@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# deploy-basic-example-workload.sh
+# deploy-example-workload.sh
 # LLMInferenceService and its MaaS governance (MaaSModelRef, MaaSSubscription,
 # MaaSAuthPolicy) — nothing OGX-specific. Once the model is published to MaaS,
 # create the GenAI Playground from the RHOAI dashboard and let the platform
 # auto-provision its OGXServer (and, on 3.5, a companion pgvector RAG store);
-# see ./remove-ogx-playground.sh to tear that down again for repeat testing.
+# delete it from the dashboard the same way to tear it down again for repeat testing.
 #
 # This is a separate script from setup-maas.sh on purpose: the platform layer
 # (operators, gateway, Authorino TLS, DSC/dashboard flags) is close to one-shot,
@@ -12,7 +12,7 @@
 # tear down independently many times.
 #
 # Usage:
-#   ./deploy-basic-example-workload.sh [--hardware-profile-name NAME] [--help]
+#   ./deploy-example-workload.sh [--hardware-profile-name NAME] [--help]
 #
 # Options:
 #   --hardware-profile-name NAME GPU HardwareProfile to use (overrides auto-detection)
@@ -50,16 +50,16 @@ parse_args() {
         shift 2 ;;
       --help)
         cat <<'USAGE'
-deploy-basic-example-workload.sh — Deploys the example MaaS workload (model + MaaS governance
+deploy-example-workload.sh — Deploys the example MaaS workload (model + MaaS governance
 only) on top of a platform configured by setup-maas.sh.
 
 This script deliberately does NOT create an OGXServer or GenAI Playground itself — create
 the Playground from the RHOAI dashboard once the model below is published, and the platform
 auto-provisions its OGXServer (RHOAI 3.5 also auto-provisions a companion pgvector RAG
-store). Use ./remove-ogx-playground.sh to tear that down again for repeat testing.
+store). Delete it from the dashboard the same way to tear it down again for repeat testing.
 
 Usage:
-  ./deploy-basic-example-workload.sh [OPTIONS]
+  ./deploy-example-workload.sh [OPTIONS]
 
 Options:
   --hardware-profile-name NAME  GPU HardwareProfile to annotate the LLMInferenceService with.
@@ -252,8 +252,8 @@ print_summary() {
   echo
   echo -e "  ${BOLD}GenAI Playground:${NC} create it from the RHOAI dashboard now that the model is"
   echo -e "  published — the platform auto-provisions its OGXServer (and, on 3.5, a companion"
-  echo -e "  pgvector RAG store). To tear that down again for repeat testing:"
-  echo -e "     ./remove-ogx-playground.sh ${MAAS_MODEL_NS}"
+  echo -e "  pgvector RAG store). Delete it from the dashboard the same way to tear it down"
+  echo -e "  again for repeat testing."
   echo
   echo -e "  Re-run this script any time to reapply the workload (all steps are idempotent)."
   echo -e "  To remove it: oc delete -f manifests/08-example-llminferenceservice.yaml -f manifests/09-example-maas-modelref.yaml \\"
