@@ -370,17 +370,21 @@ API_KEY=$(curl -sk -X POST "${MAAS_URL}/maas-api/v1/api-keys" \
   -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
   -d '{"name":"my-key","subscription":"llama-3-8b-free","expiresIn":"30d"}' | jq -r .key)
 
-# List models available to you
+# List models available to you — each has a catalog id shaped
+# publishers/<namespace>/models/<model-name>; use that id (not the bare model
+# name) in the call below
 curl -sk -H "Authorization: Bearer ${API_KEY}" "${MAAS_URL}/maas-api/v1/models" | jq
 
-# Call the model — path is /<namespace>/<model-name>/v1/..., not /llm/<model-name>/v1/...
-# (that's what the official docs describe, but it isn't wired up as an HTTPRoute on
-# every RHOAI build — check `oc get httproute -n <namespace>` if this 404s for you)
+# Call the model via the unified endpoint (model selected by the "model" field
+# in the body, not by a path segment) — confirmed more reliable than the
+# namespaced /<namespace>/<model-name>/v1/... path, which can intermittently
+# return a 200 with an empty body due to a Kuadrant WASM rate-limit-reporting
+# race (see Troubleshooting)
 curl -sk -H "Authorization: Bearer ${API_KEY}" \
-  "${MAAS_URL}/maas-models/llama-3-8b/v1/chat/completions" \
+  "${MAAS_URL}/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama-3-8b",
+    "model": "publishers/maas-models/models/llama-3-8b",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
@@ -400,7 +404,10 @@ curl -sk -H "Authorization: Bearer ${API_KEY}" \
 ### What gets removed
 
 - All `LlamaStackDistribution`/`OGXServer`, `LLMInferenceService`, and `MaaSModelRef` resources in `maas-models`, then the `maas-models` namespace itself
-- `MaaSSubscription`/`MaaSAuthPolicy` for the example model in `models-as-a-service` (the namespace itself is left in place — it's owned by RHOAI)
+- Namespace `models-as-a-service` (owned by RHOAI/`maas-controller`) — including every `MaaSSubscription`/`MaaSAuthPolicy` inside it, not just the example's (confirmed this is **not** cleaned up automatically after DSC revert, despite RHOAI owning it)
+- Namespace `ai-tenants` (another `maas-controller`-generated namespace)
+- `Config/default`'s `maas.opendatahub.io/default-aitenant-bootstrapped` annotation, cleared — **critical**: `maas-controller` only ever bootstraps the default tenant (and, transitively, deploys `maas-api` itself) **once per cluster**, gated by this flag. Since deleting the two namespaces above destroys the underlying `MaasTenantConfig`/`AITenant` objects, leaving this flag `true` would permanently prevent any future `setup-maas.sh` run from ever re-provisioning them — confirmed live, even a full DSC `Removed`→`Managed` cycle does not help once this flag is stuck.
+- Namespace `redhat-ai-gateway-infra` (holds `maas-api` itself on RHOAI 3.5+, owned by a *different* operator, `ai-gateway-operator` — confirmed live that reverting the DSC field does **not** trigger it to clean up on its own). No-op on 3.4.x, where this namespace never existed.
 - DSC MaaS setting reverted: `kserve.modelsAsService` (3.4.x) or `aigateway`/`aigateway.modelsAsAService` (3.5+) — version auto-detected
 - `genAiStudio` reverted to `false` in `OdhDashboardConfig`
 - DSC Playground backend reverted to `Removed`: `llamastackoperator` (3.4.x) or `ogx` (3.5+) — **conditionally**, only if no `LlamaStackDistribution`/`OGXServer` resources remain cluster-wide (both are cluster-scoped and may back workloads outside MaaS)
@@ -408,13 +415,26 @@ curl -sk -H "Authorization: Bearer ${API_KEY}" \
 - Authorino TLS patch reverted; Secret `authorino-server-cert` deleted (plus any leftover cert-manager `Certificate`/`ClusterIssuer` from older versions of this script)
 - PostgreSQL (`maas-db` namespace + `maas-db-config` Secret)
 
+`models-as-a-service`, `ai-tenants`, and `redhat-ai-gateway-infra` are each deleted with
+`--wait=false`, then swept after a 15s grace period for any `maas.opendatahub.io` resource
+still stuck `Terminating` inside — confirmed live that `MaaSSubscription`/`MaaSAuthPolicy`/
+`MaaSTenantConfig`/`AITenant` can all carry a `maas-controller`-owned cleanup finalizer that
+never clears once whatever they referenced (model, provider, tenant) is already gone; the
+script force-clears those automatically rather than leaving the namespace stuck forever.
+This full teardown→setup cycle (including the bootstrap-marker reset) has been verified
+live end-to-end with zero manual intervention required.
+
 With `--full`, cert-manager, RHCL/Kuadrant, the `openshift-default` GatewayClass, and MetalLB (operator, CR, IPAddressPool) are also uninstalled — the MetalLB removal is a harmless no-op on cloud platforms, where it was never installed.
 
 ### Not removed in either mode
 
 - RHOAI operator and the DataScienceCluster itself (pre-existing)
 - `cluster-monitoring-config` (may be used by other workloads)
-- `models-as-a-service` namespace (RHOAI cleans it up after the DSC reconciles — can get stuck `Terminating` if `maas-controller` is unhealthy when the `Tenant` CR's finalizer needs to run; see [TEARDOWN-README.md](TEARDOWN-README.md#force-delete-a-stuck-namespace) for the force-delete procedure)
+
+If `models-as-a-service`, `ai-tenants`, or `redhat-ai-gateway-infra` still stay stuck
+`Terminating` despite the automatic finalizer sweep (their own namespace finalizer, not a
+resource inside them), see
+[TEARDOWN-README.md](TEARDOWN-README.md#force-delete-a-stuck-namespace) for the force-delete procedure.
 
 ---
 
@@ -474,6 +494,30 @@ oc get secret authorino-server-cert -n kuadrant-system
 `certSecretRef.name` must be `authorino-server-cert` (issued by the OpenShift service-ca
 operator). If it's a different, self-signed secret, every MaaS API call will 500 with
 `gRPC status code is not OK` in the gateway's Envoy logs.
+
+### Inference call returns `200` with an empty body
+Confirmed live: the namespaced inference path (`/<namespace>/<model-name>/v1/chat/completions`)
+can intermittently return `HTTP 200` with zero bytes of body — check with
+`curl -w '%{size_download}\n'`, since a `200` status code alone doesn't guarantee a real
+response on this path. The gateway pod's own logs show why, at the same timestamps:
+```bash
+oc logs -n openshift-ingress -l gateway.networking.k8s.io/gateway-name=maas-default-gateway --since=2m \
+  | grep -i "invalid context_id"
+```
+This is a race in Kuadrant's Envoy WASM shim: `TokenRateLimitPolicy` needs to read
+`/usage/total_tokens` out of the response body to report token consumption to Limitador,
+via an async gRPC call keyed by a `context_id`. Under some timing conditions that gRPC
+callback can't find a matching context, and whatever continuation is supposed to release
+the buffered response body to the client never fires — response headers had already gone
+out, so the client sees a "successful" `200` with nothing behind it. Not fixable from this
+repo; it's upstream in RHCL/Kuadrant's WASM shim.
+
+**Workaround**: use the unified `/v1/chat/completions` endpoint instead (model selected via
+the `model` field in the body, catalog id shaped `publishers/<namespace>/models/<model-name>`
+— see [Deploying your own model, §3](#3-call-the-api)), which does not go through the same
+HTTPRoute/TokenRateLimitPolicy path and was not observed to reproduce this in repeated
+testing. If you must use the namespaced path, retry on an empty body — the race is
+timing-dependent, and a retry typically succeeds.
 
 ### Minting an API key returns no `.key` field (`jq -r .key` prints `null`)
 The `subscription` field in the `POST /maas-api/v1/api-keys` request body must exactly

@@ -73,10 +73,11 @@ Deploys, in order:
   2. MaaSModelRef, MaaSSubscription, MaaSAuthPolicy (manifests/09-11) — publishes the
      model to MaaS and grants system:authenticated users a 100k-tokens/24h quota
 
-Once published, the model is callable externally via the MaaS gateway at
-https://maas.<apps-domain>/maas-models/llama-3-8b/v1/chat/completions, authenticated with a
-MaaS API key (not a raw OpenShift token) — see the summary printed at the end for the
-exact commands to mint one.
+Once published, the model is callable externally via the MaaS gateway's unified endpoint at
+https://maas.<apps-domain>/v1/chat/completions (model selected by the "model" field in the
+body, catalog id "publishers/maas-models/models/llama-3-8b"), authenticated with a MaaS API
+key (not a raw OpenShift token) — see the summary printed at the end for the exact commands
+to mint one.
 
 HardwareProfile resolution order for step 1 (opendatahub.io/hardware-profile-name annotation):
   1. --hardware-profile-name / HARDWARE_PROFILE_NAME, if set
@@ -247,8 +248,8 @@ print_summary() {
   echo -e "       -H \"Authorization: Bearer \$TOKEN\" -H \"Content-Type: application/json\" \\"
   echo -e "       -d '{\"name\":\"my-key\",\"subscription\":\"llama-3-8b-free\",\"expiresIn\":\"1h\"}' | jq -r .key)"
   echo -e "     curl -sk -H \"Authorization: Bearer \$API_KEY\" -H \"Content-Type: application/json\" \\"
-  echo -e "       ${maas_url}/${MAAS_MODEL_NS}/llama-3-8b/v1/chat/completions \\"
-  echo -e "       -d '{\"model\":\"llama-3-8b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
+  echo -e "       ${maas_url}/v1/chat/completions \\"
+  echo -e "       -d '{\"model\":\"publishers/${MAAS_MODEL_NS}/models/llama-3-8b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
   echo
   echo -e "  ${BOLD}GenAI Playground:${NC} create it from the RHOAI dashboard now that the model is"
   echo -e "  published — the platform auto-provisions its OGXServer (and, on 3.5, a companion"
