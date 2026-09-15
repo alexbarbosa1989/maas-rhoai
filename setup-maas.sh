@@ -613,6 +613,23 @@ deploy_postgresql() {
   log_ok "PostgreSQL is Running and 'maas-db-config' Secret created."
 }
 
+# Confirmed live: RHOAI's maas-controller does NOT reliably (re)create models-as-a-service
+# on its own — unlike ai-tenants (self-healed on a ~30s loop, confirmed via maas-controller's
+# own logs), models-as-a-service has no equivalent ongoing reconcile. A clean
+# Removed→Managed transition of aigateway.modelsAsAService left ModelsAsAServiceReady=True
+# for a full 2 minutes without the namespace ever reappearing — the DSC's own "Ready"
+# status does not verify it exists. So create it explicitly rather than trusting the
+# platform to, same as create_model_namespace() already does for maas-models.
+ensure_governance_namespace() {
+  log_step "Step 13: Ensuring 'models-as-a-service' namespace exists"
+  if resource_exists namespace models-as-a-service; then
+    log_ok "Namespace 'models-as-a-service' already exists."
+  else
+    apply_manifest "${MANIFESTS_DIR}/06i-models-as-a-service-namespace.yaml"
+    log_ok "Namespace 'models-as-a-service' created."
+  fi
+}
+
 # Works around a maas-api/maas-controller version-skew bug — RHOAI 3.4.x only (see
 # 06h-maas-api-rbac-workaround.yaml; hardcodes maas-api's ServiceAccount as living in
 # RHOAI_APP_NS, which is only true pre-3.5). No-ops if the models-as-a-service namespace
@@ -633,7 +650,7 @@ apply_maas_api_rbac_workaround() {
 }
 
 enable_maas_in_dsc() {
-  log_step "Step 13: Enabling MaaS (modelsAsService) in the DataScienceCluster"
+  log_step "Step 14: Enabling MaaS (modelsAsService) in the DataScienceCluster"
   # RHOAI 3.4.x only — see enable_maas_in_dsc_aigateway() for the 3.5+ path. Field is
   # deprecated starting 3.5 (preserved for backward compatibility through 3.6 per the DSC
   # CRD schema), and its CEL rule is one-directional: Managed→Removed is allowed,
@@ -719,7 +736,7 @@ enable_maas_in_dsc() {
 }
 
 enable_maas_in_dsc_aigateway() {
-  log_step "Step 13: Enabling MaaS (aigateway.modelsAsAService) in the DataScienceCluster"
+  log_step "Step 14: Enabling MaaS (aigateway.modelsAsAService) in the DataScienceCluster"
   # RHOAI 3.5+ only. Confirmed live: MaaS moved from spec.components.kserve.modelsAsService
   # to spec.components.aigateway.modelsAsAService (double-A, not a typo), gated by the
   # PARENT aigateway.managementState, which defaults to Removed if unset. Setting only the
@@ -783,7 +800,7 @@ enable_maas_in_dsc_aigateway() {
 }
 
 enable_genai_studio() {
-  log_step "Step 14: Enabling GenAI Studio in OdhDashboardConfig"
+  log_step "Step 15: Enabling GenAI Studio in OdhDashboardConfig"
 
   if ! oc get OdhDashboardConfig odh-dashboard-config -n "$RHOAI_APP_NS" &>/dev/null; then
     log_warn "OdhDashboardConfig 'odh-dashboard-config' not found in '${RHOAI_APP_NS}' — skipping."
@@ -807,7 +824,7 @@ enable_genai_studio() {
 }
 
 enable_llamastack_operator() {
-  log_step "Step 15: Enabling LlamaStack operator in the DataScienceCluster (required for GenAI Playground)"
+  log_step "Step 16: Enabling LlamaStack operator in the DataScienceCluster (required for GenAI Playground)"
   # RHOAI 3.4.x only — LlamaStack is replaced by OGX starting 3.5EA1 (see
   # enable_ogx_operator() below).
 
@@ -832,7 +849,7 @@ enable_llamastack_operator() {
 }
 
 enable_ogx_operator() {
-  log_step "Step 15: Enabling OGX component in the DataScienceCluster (required for GenAI Playground, RHOAI 3.5+)"
+  log_step "Step 16: Enabling OGX component in the DataScienceCluster (required for GenAI Playground, RHOAI 3.5+)"
   # RHOAI 3.5EA1+ only — OGX ("Open GenAI Stack") replaces the LlamaStack operator.
 
   local current_state
@@ -884,7 +901,7 @@ enable_ogx_operator() {
 verify_maas_components() {
   # $1: "true" on RHOAI 3.5+, "false"/unset on 3.4.x.
   local is_35_plus="${1:-false}"
-  log_step "Step 16: Verifying all MaaS platform components"
+  log_step "Step 17: Verifying all MaaS platform components"
 
   wait_for_pods "$RHOAI_APP_NS" "app.kubernetes.io/name=model-serving-api" "$POD_WAIT_TIMEOUT"
   wait_for_pods "$RHOAI_APP_NS" "control-plane=llmisvc-controller-manager" "$POD_WAIT_TIMEOUT"
@@ -930,7 +947,7 @@ verify_maas_components() {
 }
 
 create_model_namespace() {
-  log_step "Step 17: Creating MaaS model namespace '${MAAS_MODEL_NS}'"
+  log_step "Step 18: Creating MaaS model namespace '${MAAS_MODEL_NS}'"
 
   if resource_exists namespace "$MAAS_MODEL_NS"; then
     log_warn "Namespace '${MAAS_MODEL_NS}' already exists — skipping."
@@ -1029,8 +1046,8 @@ print_summary() {
   echo -e "       -H \"Authorization: Bearer \$TOKEN\" -H \"Content-Type: application/json\" \\"
   echo -e "       -d '{\"name\":\"my-key\",\"subscription\":\"llama-3-8b-free\",\"expiresIn\":\"1h\"}' | jq -r .key)"
   echo -e "     curl -sk -H \"Authorization: Bearer \$API_KEY\" -H \"Content-Type: application/json\" \\"
-  echo -e "       https://maas.${cluster_domain}/${MAAS_MODEL_NS}/llama-3-8b/v1/chat/completions \\"
-  echo -e "       -d '{\"model\":\"llama-3-8b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
+  echo -e "       https://maas.${cluster_domain}/v1/chat/completions \\"
+  echo -e "       -d '{\"model\":\"publishers/${MAAS_MODEL_NS}/models/llama-3-8b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
   echo
   echo -e "  ${BOLD}RHOAI Dashboard:${NC}"
   echo -e "  $(oc get route rhods-dashboard -n "$RHOAI_APP_NS" \
@@ -1074,6 +1091,7 @@ main() {
   label_gateway_namespaces
   create_passthrough_route
   deploy_postgresql
+  ensure_governance_namespace
 
   if [[ "$rhoai_is_35_plus" == "true" ]]; then
     enable_maas_in_dsc_aigateway

@@ -56,9 +56,20 @@ Provides the `OpenTelemetryCollector` CRD. Without it the Monitoring controller 
 
 ### Step 4 — Install Cluster Observability Operator (COO)
 Provides the Perses CRDs (`Perses`, `PersesDatasource`, `PersesDashboard`) that back the
-Observability Dashboard tab in the RHOAI UI. Pinned to `v1.4.0` with **Manual** install-plan
-approval (avoids regressions in newer COO releases) — `setup.sh` auto-approves the resulting
-InstallPlan via `approve_installplan_for_sub` (from `../lib/common.sh`).
+Observability Dashboard tab in the RHOAI UI. RHOAI version is auto-detected (same approach
+as `../setup-maas.sh`) to pick one of two subscriptions:
+
+- **RHOAI < 3.4.3**: pinned to `v1.4.0` with **Manual** install-plan approval
+  (`manifests/operators/coo/subscription.yaml`) — avoids a regression in newer COO releases.
+  `setup.sh` auto-approves the resulting InstallPlan via `approve_installplan_for_sub`
+  (from `../lib/common.sh`).
+- **RHOAI 3.4.3+**: tracks the `stable` channel's latest CSV with **Automatic** approval
+  (`manifests/operators/coo/subscription-latest.yaml`) — RHOAI 3.4.3+ is confirmed
+  compatible with newer COO releases, so the pin is no longer needed.
+
+This only takes effect on a fresh COO install — if COO is already installed and its CSV is
+already `Succeeded`, this step skips entirely regardless of which subscription it would
+have chosen (same idempotent-skip behavior as every other operator install in this repo).
 
 ### Step 5 — Enable DSCI monitoring
 Patches `DSCInitialization/default-dsci` with `spec.monitoring.metrics` (5Gi storage, 90-day
@@ -131,7 +142,9 @@ maas-observability/
     └── operators/
         ├── tempo/{namespace,operatorgroup,subscription}.yaml
         ├── opentelemetry/{namespace,operatorgroup,subscription}.yaml
-        └── coo/{namespace,operatorgroup,subscription}.yaml
+        └── coo/{namespace,operatorgroup,subscription,subscription-latest}.yaml
+            # subscription.yaml: pinned v1.4.0, Manual approval (RHOAI < 3.4.3)
+            # subscription-latest.yaml: stable channel, Automatic approval (RHOAI 3.4.3+)
 ```
 
 (No `telemetry/` manifests here — `TelemetryPolicy`/`Telemetry` are auto-created by
