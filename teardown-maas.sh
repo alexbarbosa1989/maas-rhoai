@@ -6,7 +6,8 @@
 #   ./teardown-maas.sh [--full] [--yes]
 #
 # Options:
-#   --full  Also uninstall cert-manager and RHCL operators
+#   --full  Also uninstall cert-manager, RHCL/Kuadrant, the openshift-default GatewayClass,
+#           and MetalLB
 #   --yes   Skip the confirmation prompt
 #   --help  Show this message
 
@@ -54,12 +55,30 @@ Without --full the following are removed:
   - All LlamaStackDistribution, LLMInferenceService, and MaaSModelRef in maas-models
     (plus any leftover AuthPolicy/RateLimitPolicy/TokenRateLimitPolicy/RoleBinding
     from older versions of this script)
-  - MaaSSubscription 'llama-3-8b-free' and MaaSAuthPolicy 'llama-3-8b-access'
-    in models-as-a-service (the namespace itself is left in place — it's owned by RHOAI)
   - maas-api RBAC workaround (Role/RoleBinding/ClusterRole/ClusterRoleBinding) for the
     maas-api/maas-controller image version-skew bug (RHOAI 3.4.x only; no-op on 3.5+)
   - Namespace maas-models
+  - Namespace models-as-a-service (owned by RHOAI/maas-controller — includes every
+    MaaSSubscription/MaaSAuthPolicy inside it, not just the example's)
+  - Namespace ai-tenants (another maas-controller-generated namespace)
+  For both: deleted with --wait=false, then after a 15s grace period any
+  maas.opendatahub.io resource still stuck Terminating inside (confirmed to happen —
+  MaaSSubscription/MaaSAuthPolicy/MaaSTenantConfig/AITenant all carry a
+  maas-controller-owned cleanup finalizer that can never clear once whatever they
+  referenced is already gone) has its finalizers force-cleared automatically.
+  - Config/default's maas.opendatahub.io/default-aitenant-bootstrapped annotation cleared.
+    CRITICAL: maas-controller only ever bootstraps the default MaasTenantConfig/AITenant
+    (and, transitively, deploys maas-api itself) ONCE per cluster, gated by this flag.
+    Deleting models-as-a-service/ai-tenants above destroys those objects — if this flag is
+    left at "true", no future setup-maas.sh run will ever re-trigger bootstrap again (not
+    even a full DSC Removed→Managed cycle — confirmed live: ModelsAsAServiceReady reports
+    True throughout, but maas-api never gets redeployed), permanently breaking MaaS on this
+    cluster. Clearing it here is what makes the next setup-maas.sh run actually work.
   - DSC MaaS setting reverted: modelsAsService (3.4.x) or aigateway/modelsAsAService (3.5+)
+  - Namespace redhat-ai-gateway-infra (holds maas-api itself on RHOAI 3.5+, owned by
+    ai-gateway-operator — a different operator than maas-controller; confirmed live that
+    reverting the DSC field above does NOT trigger this operator to clean it up on its
+    own, unlike what you'd expect). No-op on 3.4.x, where this namespace never existed.
   - genAiStudio reverted to false in OdhDashboardConfig
   - DSC Playground backend reverted (Removed): llamastackoperator (3.4.x) or ogx (3.5+)
     — only if no LlamaStackDistribution/OGXServer resources remain anywhere on the
@@ -78,7 +97,10 @@ Only with --full:
 Not removed in either mode:
   - RHOAI operator and DataScienceCluster (pre-existing)
   - cluster-monitoring-config (may be used by other workloads)
-  - models-as-a-service namespace (RHOAI cleans it up after DSC revert)
+
+If 'models-as-a-service', 'ai-tenants', or 'redhat-ai-gateway-infra' still stay stuck
+Terminating despite the automatic finalizer sweep above (the namespace's own finalizer,
+not a resource inside it), see TEARDOWN-README.md's force-delete procedure.
 USAGE
         exit 0 ;;
       *) log_error "Unknown argument: $arg"; exit 1 ;;
@@ -130,6 +152,60 @@ confirm() {
 
 # ─── Teardown steps ───────────────────────────────────────────────────────────
 
+# force_clear_stuck_finalizers NAMESPACE
+# Sweeps every namespaced maas.opendatahub.io resource kind (MaaSSubscription,
+# MaaSAuthPolicy, MaaSModelRef, MaaSTenantConfig, AITenant, Tenant, ExternalModel — the
+# full API group, discovered dynamically rather than hardcoded, since this turned out to
+# be a systemic pattern, not a one-off) for objects in NAMESPACE that still have a
+# deletionTimestamp set — i.e. deletion was already requested (by the namespace delete's
+# own cascade, moments ago) but never completed. Confirmed live: MaaSSubscription,
+# MaaSAuthPolicy, MaaSTenantConfig, and AITenant have ALL been observed stuck this way —
+# each carries its own maas.opendatahub.io/<kind>-cleanup finalizer that maas-controller
+# can never clear once whatever it referenced (model, provider, tenant) is already gone,
+# leaving the object — and the namespace containing it — in Terminating forever. Safe
+# specifically because this only ever touches objects already mid-deletion, never
+# anything a user still wants — same class of override as TEARDOWN-README.md's
+# namespace-level force-delete recipe, just scoped to the CR itself (a plain merge patch
+# works here; unlike a stuck Namespace, no /finalize subresource trick is needed).
+force_clear_stuck_finalizers() {
+  local ns="$1"
+  local kind
+  for kind in $(oc api-resources --api-group=maas.opendatahub.io --namespaced -o name 2>/dev/null); do
+    local stuck
+    stuck=$(oc get "$kind" -n "$ns" -o json 2>/dev/null \
+      | python3 -c "
+import json, sys
+for item in json.load(sys.stdin).get('items', []):
+    if item.get('metadata', {}).get('deletionTimestamp'):
+        print(item['metadata']['name'])
+" 2>/dev/null)
+    [[ -z "$stuck" ]] && continue
+    while IFS= read -r name; do
+      [[ -z "$name" ]] && continue
+      log_warn "${kind} '${name}' in '${ns}' still Terminating after the grace period — clearing its finalizers."
+      oc patch "$kind" "$name" -n "$ns" --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+    done <<< "$stuck"
+  done
+}
+
+# delete_namespace_with_finalizer_fallback NAMESPACE
+# Requests deletion (--wait=false, so a stuck finalizer elsewhere can't hang the rest of
+# this script), waits a grace period for maas-controller to reconcile cleanup on its own,
+# then sweeps for and force-clears anything still stuck. Namespace deletion cascades to
+# everything inside it, so no need to delete individual CRs first.
+delete_namespace_with_finalizer_fallback() {
+  local ns="$1"
+  if ! oc get namespace "$ns" &>/dev/null; then
+    log_warn "Namespace '${ns}' not found — skipping."
+    return 0
+  fi
+  oc delete namespace "$ns" --ignore-not-found --wait=false 2>/dev/null || true
+  log_info "Waiting 15 s for maas-controller to clear '${ns}' resource finalizers…"
+  sleep 15
+  force_clear_stuck_finalizers "$ns"
+  log_ok "Namespace '${ns}' deletion requested (--wait=false; may take a moment — see TEARDOWN-README.md if it stays Terminating)."
+}
+
 delete_model_workloads() {
   log_step "Deleting model workloads in '${MAAS_MODEL_NS}'"
   if ! oc get namespace "$MAAS_MODEL_NS" &>/dev/null; then
@@ -148,16 +224,34 @@ delete_model_workloads() {
   oc delete tokenratelimitpolicy --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
   oc delete rolebinding --all -n "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
 
-  # MaaSSubscription/MaaSAuthPolicy live in models-as-a-service (fixed by the CRD, not
-  # maas-models), and that namespace is owned by RHOAI — delete only the named example
-  # resources, not the namespace itself.
-  oc delete maassubscription llama-3-8b-free -n models-as-a-service --ignore-not-found 2>/dev/null || true
-  oc delete maasauthpolicy llama-3-8b-access -n models-as-a-service --ignore-not-found 2>/dev/null || true
-
   log_info "Waiting 15 s for controller to clean up dependent resources…"
   sleep 15
   oc delete namespace "$MAAS_MODEL_NS" --ignore-not-found 2>/dev/null || true
   log_ok "Namespace '${MAAS_MODEL_NS}' deleted."
+
+  # models-as-a-service and ai-tenants are both owned by RHOAI (created by
+  # maas-controller reconciling MaaSTenantConfig/AITenant) — confirmed live this is NOT
+  # cleaned up automatically after DSC revert as previously assumed, so delete them
+  # explicitly. Namespace deletion cascades to everything inside (MaaSSubscription,
+  # MaaSAuthPolicy, etc. — no need to delete those individually first), but see
+  # delete_namespace_with_finalizer_fallback for why a plain delete alone isn't enough.
+  delete_namespace_with_finalizer_fallback models-as-a-service
+  delete_namespace_with_finalizer_fallback ai-tenants
+
+  # CRITICAL: reset the one-time bootstrap marker BEFORE it's too late to matter. Confirmed
+  # live: maas-controller only ever creates the default MaasTenantConfig/AITenant (and,
+  # transitively, deploys maas-api itself into redhat-ai-gateway-infra) once per cluster,
+  # gated by the annotation maas.opendatahub.io/default-aitenant-bootstrapped on the
+  # cluster-scoped Config/default resource. We just deleted those objects above by deleting
+  # their namespaces — if this flag is left at "true", NO future setup-maas.sh run will ever
+  # re-trigger bootstrap again (not even a full Removed→Managed DSC cycle — confirmed live:
+  # ModelsAsAServiceReady reports True throughout, but maas-api never gets redeployed and
+  # models-as-a-service/ai-tenants never get their Tenant objects back), permanently
+  # breaking MaaS on this cluster until someone finds and manually clears this annotation.
+  if resource_exists config.maas.opendatahub.io default; then
+    oc annotate config.maas.opendatahub.io default maas.opendatahub.io/default-aitenant-bootstrapped- 2>/dev/null || true
+    log_ok "Cleared maas-controller's one-time bootstrap marker (Config/default) so the next setup-maas.sh run re-provisions the tenant correctly."
+  fi
 }
 
 delete_maas_api_rbac_workaround() {
@@ -255,6 +349,19 @@ revert_ogx_operator() {
   log_ok "DataScienceCluster ogx set to Removed."
 }
 
+delete_ai_gateway_infra_namespace() {
+  log_step "Deleting maas-api runtime namespace 'redhat-ai-gateway-infra' (RHOAI 3.5+ only)"
+  # On RHOAI 3.5+, maas-api itself (not just governance CRs) lives here — a different
+  # namespace, owned by a different operator (ai-gateway-operator, not maas-controller;
+  # confirmed via its own `app.kubernetes.io/managed-by` label). Confirmed live: setting
+  # aigateway.managementState to Removed (revert_dsc, just above) does NOT trigger this
+  # operator to clean up its own namespace — no deletionTimestamp appears even minutes
+  # after the DSC field flips. So delete it explicitly, same as models-as-a-service/
+  # ai-tenants. Harmless no-op on RHOAI 3.4.x, where this namespace never existed
+  # (maas-api lives in redhat-ods-applications there instead).
+  delete_namespace_with_finalizer_fallback redhat-ai-gateway-infra
+}
+
 delete_maas_gateway() {
   log_step "Deleting MaaS gateway"
   oc delete route maas-default-gateway-https -n openshift-ingress --ignore-not-found 2>/dev/null || true
@@ -346,6 +453,7 @@ main() {
   delete_model_workloads   # delete workloads before reverting DSC so controller can clean up
   delete_maas_api_rbac_workaround
   revert_dsc
+  delete_ai_gateway_infra_namespace
   revert_genai_studio
   if rhoai_is_35_plus; then
     revert_ogx_operator
@@ -373,7 +481,11 @@ main() {
   fi
   log_warn "'cluster-monitoring-config' in openshift-monitoring was not removed"
   log_warn "  (may be used by other workloads — delete manually if needed)."
-  log_warn "'models-as-a-service' namespace will be cleaned up by RHOAI after DSC reconciles."
+  log_info "'models-as-a-service', 'ai-tenants', and 'redhat-ai-gateway-infra' namespaces"
+  log_info "  were deleted, including an automatic sweep for stuck maas-controller"
+  log_info "  finalizers — check 'oc get namespace models-as-a-service ai-tenants"
+  log_info "  redhat-ai-gateway-infra' if you want to confirm they finished (see"
+  log_info "  TEARDOWN-README.md if any still stays Terminating)."
 }
 
 main "$@"

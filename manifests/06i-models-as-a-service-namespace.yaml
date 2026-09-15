@@ -1,0 +1,17 @@
+# Namespace where MaaSSubscription/MaaSAuthPolicy/MaaSTenantConfig live — fixed by the CRD,
+# not configurable. Confirmed live (RHOAI 3.5.0) that this is NOT reliably (re)created by
+# RHOAI's own maas-controller: unlike ai-tenants (which maas-controller actively self-heals
+# on a ~30s loop — confirmed via its own logs), models-as-a-service has no equivalent
+# ongoing reconcile. A clean Removed→Managed DSC transition on aigateway.modelsAsAService
+# left ModelsAsAServiceReady=True for a full 2 minutes without ever recreating this
+# namespace — RHOAI's own "Ready" status does not verify it exists. So this script creates
+# it explicitly rather than trusting the platform to.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: models-as-a-service
+  labels:
+    app.kubernetes.io/managed-by: maas-controller
+    app.kubernetes.io/part-of: maas-controller
+    kubernetes.io/metadata.name: models-as-a-service
+    opendatahub.io/generated-namespace: "true"
