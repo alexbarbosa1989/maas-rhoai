@@ -109,6 +109,8 @@ check_prerequisites() {
   fi
   log_ok "DSCInitialization '${DSCI_NAME}' exists."
 
+  detect_rhoai_version
+
   if ! resource_exists kuadrant kuadrant "$KUADRANT_NS"; then
     log_error "Kuadrant CR not found in '${KUADRANT_NS}'. Run ../setup-maas.sh first."
     exit 1
@@ -172,6 +174,36 @@ install_opentelemetry_operator() {
   log_ok "OpenTelemetry operator is ready."
 }
 
+# Sets RHOAI_MAJOR/RHOAI_MINOR/RHOAI_PATCH (global, not local — read by
+# rhoai_supports_coo_latest() below) from the rhods-operator CSV, same approach
+# ../setup-maas.sh uses for its own version-gated branching.
+detect_rhoai_version() {
+  local rhoai_csv rhoai_version
+  rhoai_csv=$(oc get csv -n "$RHOAI_OPERATOR_NS" 2>/dev/null \
+    | awk '/rhods-operator/{print $1}' | head -1)
+  if [[ -z "$rhoai_csv" ]]; then
+    log_warn "RHOAI operator CSV not found in '${RHOAI_OPERATOR_NS}' — cannot detect version."
+    log_warn "Assuming pre-3.4.3 (pinned COO v1.4.0) for install_coo(); override by editing"
+    log_warn "manifests/operators/coo/subscription-latest.yaml usage manually if this is wrong."
+    RHOAI_MAJOR=0; RHOAI_MINOR=0; RHOAI_PATCH=0
+    return 0
+  fi
+  rhoai_version=$(echo "$rhoai_csv" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+  RHOAI_MAJOR=$(echo "$rhoai_version" | cut -d. -f1)
+  RHOAI_MINOR=$(echo "$rhoai_version" | cut -d. -f2)
+  RHOAI_PATCH=$(echo "$rhoai_version" | cut -d. -f3)
+  log_ok "Detected RHOAI ${rhoai_version} (${rhoai_csv})."
+}
+
+# True from RHOAI 3.4.3 onward (and any 3.5+/future major) — the version confirmed to have
+# the COO regression fixed that subscription.yaml's v1.4.0 pin otherwise works around.
+rhoai_supports_coo_latest() {
+  (( RHOAI_MAJOR > 3 )) && return 0
+  (( RHOAI_MAJOR == 3 && RHOAI_MINOR > 4 )) && return 0
+  (( RHOAI_MAJOR == 3 && RHOAI_MINOR == 4 && RHOAI_PATCH >= 3 )) && return 0
+  return 1
+}
+
 install_coo() {
   log_step "Step 4: Installing Cluster Observability Operator (COO)"
 
@@ -185,9 +217,17 @@ install_coo() {
 
   apply_manifest "${MANIFESTS_DIR}/operators/coo/namespace.yaml"
   apply_manifest "${MANIFESTS_DIR}/operators/coo/operatorgroup.yaml"
-  apply_manifest "${MANIFESTS_DIR}/operators/coo/subscription.yaml"
 
-  # COO is pinned to v1.4.0 with Manual install-plan approval (see subscription.yaml).
+  if rhoai_supports_coo_latest; then
+    log_info "RHOAI ${RHOAI_MAJOR}.${RHOAI_MINOR}.${RHOAI_PATCH} >= 3.4.3 — tracking COO's stable channel latest (Automatic approval, no version pin)."
+    apply_manifest "${MANIFESTS_DIR}/operators/coo/subscription-latest.yaml"
+  else
+    log_info "RHOAI ${RHOAI_MAJOR}.${RHOAI_MINOR}.${RHOAI_PATCH} < 3.4.3 — using the pinned COO v1.4.0 (Manual approval) to avoid the known regression on newer COO releases."
+    apply_manifest "${MANIFESTS_DIR}/operators/coo/subscription.yaml"
+  fi
+
+  # No-op if the subscription above already resolved to Automatic approval — this only
+  # does something for the pinned (Manual) path.
   approve_installplan_for_sub "$COO_NS" "cluster-observability-operator"
 
   wait_for_csv "$COO_NS" "cluster-observability-operator" "$OPERATOR_WAIT_TIMEOUT" \

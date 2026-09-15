@@ -2,6 +2,10 @@
 # rh-aiservices-bu/rhoai-maas-guide companion repo's Phase 7) to avoid potential
 # regressions in newer COO releases. install_coo() in setup.sh approves the
 # resulting InstallPlan automatically via approve_installplan_for_sub.
+#
+# Only used when the cluster's RHOAI version is below 3.4.3 — install_coo() switches to
+# subscription-latest.yaml (stable channel, Automatic approval) on RHOAI 3.4.3+, once the
+# regression this pin works around is confirmed fixed upstream.
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
