@@ -5,6 +5,7 @@ the rh-aiservices-bu [rhoai-maas-guide](https://rh-aiservices-bu.github.io/rhoai
 companion guide's Gateway approach and the official documentation:
 [Govern LLM access with Models-as-a-Service](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html-single/govern_llm_access_with_models-as-a-service/index).
 
+## DISCLAIMER: this is not a official Red Hat procedure. It was build only for learning purposes
 ---
 
 ## What MaaS does
