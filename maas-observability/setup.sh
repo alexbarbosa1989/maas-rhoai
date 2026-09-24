@@ -175,15 +175,16 @@ install_opentelemetry_operator() {
 }
 
 # Sets RHOAI_MAJOR/RHOAI_MINOR/RHOAI_PATCH (global, not local — read by
-# rhoai_supports_coo_latest() below) from the rhods-operator CSV, same approach
-# ../setup-maas.sh uses for its own version-gated branching.
+# rhoai_supports_coo_latest()/rhoai_has_telemetry_cel_guard_fix() below) from the
+# rhods-operator CSV, same approach ../setup-maas.sh uses for its own version-gated
+# branching.
 detect_rhoai_version() {
   local rhoai_csv rhoai_version
   rhoai_csv=$(oc get csv -n "$RHOAI_OPERATOR_NS" 2>/dev/null \
     | awk '/rhods-operator/{print $1}' | head -1)
   if [[ -z "$rhoai_csv" ]]; then
     log_warn "RHOAI operator CSV not found in '${RHOAI_OPERATOR_NS}' — cannot detect version."
-    log_warn "Assuming pre-3.4.3 (pinned COO v1.4.0) for install_coo(); override by editing"
+    log_warn "Assuming pre-3.5 (pinned COO v1.4.0) for install_coo(); override by editing"
     log_warn "manifests/operators/coo/subscription-latest.yaml usage manually if this is wrong."
     RHOAI_MAJOR=0; RHOAI_MINOR=0; RHOAI_PATCH=0
     return 0
@@ -195,12 +196,28 @@ detect_rhoai_version() {
   log_ok "Detected RHOAI ${rhoai_version} (${rhoai_csv})."
 }
 
-# True from RHOAI 3.4.3 onward (and any 3.5+/future major) — the version confirmed to have
-# the COO regression fixed that subscription.yaml's v1.4.0 pin otherwise works around.
+# True from RHOAI 3.5.0 onward (and any future major) — the COO v1.4.0 pin is a
+# workaround needed for the entire RHOAI 3.4.x line; RHOAI 3.5 accepts COO's stable
+# channel latest with no known regression. This is a minor-version boundary, not a
+# patch-level one — every 3.4.x patch release still needs the pin.
 rhoai_supports_coo_latest() {
   (( RHOAI_MAJOR > 3 )) && return 0
+  (( RHOAI_MAJOR == 3 && RHOAI_MINOR >= 5 )) && return 0
+  return 1
+}
+
+# True from RHOAI 3.4.4 onward (and any 3.5+/future major) — the version that ships
+# maas-controller's has()-guard fix for the auto-generated TelemetryPolicy's
+# organization_id/cost_center CEL expressions (opendatahub-io/models-as-a-service PR
+# #1276/#1311, downstream red-hat-data-services#652, RHOAIENG-80096). Below this version,
+# a MaaSSubscription without tokenMetadata.organizationId/costCenter makes the wasm task
+# throw CelError::Resolve{NoSuchKey} and silently drop that subscription's usage report.
+# From this version on, tokenMetadata is genuinely optional (missing values just mean
+# blank organization_id/cost_center labels).
+rhoai_has_telemetry_cel_guard_fix() {
+  (( RHOAI_MAJOR > 3 )) && return 0
   (( RHOAI_MAJOR == 3 && RHOAI_MINOR > 4 )) && return 0
-  (( RHOAI_MAJOR == 3 && RHOAI_MINOR == 4 && RHOAI_PATCH >= 3 )) && return 0
+  (( RHOAI_MAJOR == 3 && RHOAI_MINOR == 4 && RHOAI_PATCH >= 4 )) && return 0
   return 1
 }
 
@@ -219,10 +236,10 @@ install_coo() {
   apply_manifest "${MANIFESTS_DIR}/operators/coo/operatorgroup.yaml"
 
   if rhoai_supports_coo_latest; then
-    log_info "RHOAI ${RHOAI_MAJOR}.${RHOAI_MINOR}.${RHOAI_PATCH} >= 3.4.3 — tracking COO's stable channel latest (Automatic approval, no version pin)."
+    log_info "RHOAI ${RHOAI_MAJOR}.${RHOAI_MINOR}.${RHOAI_PATCH} >= 3.5.0 — tracking COO's stable channel latest (Automatic approval, no version pin)."
     apply_manifest "${MANIFESTS_DIR}/operators/coo/subscription-latest.yaml"
   else
-    log_info "RHOAI ${RHOAI_MAJOR}.${RHOAI_MINOR}.${RHOAI_PATCH} < 3.4.3 — using the pinned COO v1.4.0 (Manual approval) to avoid the known regression on newer COO releases."
+    log_info "RHOAI ${RHOAI_MAJOR}.${RHOAI_MINOR}.${RHOAI_PATCH} < 3.5.0 — using the pinned COO v1.4.0 (Manual approval) to avoid the known regression on newer COO releases."
     apply_manifest "${MANIFESTS_DIR}/operators/coo/subscription.yaml"
   fi
 
@@ -301,20 +318,20 @@ enable_kuadrant_observability() {
 }
 
 enable_maas_telemetry() {
-  log_step "Step 7: Enabling MaaS gateway telemetry in the Tenant CR"
+  log_step "Step 7: Enabling MaaS gateway telemetry in the MaaSTenantConfig CR"
 
   local current
-  current=$(oc get tenants.maas.opendatahub.io "$MAAS_TENANT_NAME" -n "$MAAS_TENANT_NS" \
+  current=$(oc get maastenantconfigs.maas.opendatahub.io "$MAAS_TENANT_NAME" -n "$MAAS_TENANT_NS" \
     -o jsonpath='{.spec.telemetry.enabled}' 2>/dev/null)
 
   if [[ "$current" == "true" ]]; then
-    log_ok "Tenant telemetry already enabled — skipping."
+    log_ok "MaaSTenantConfig telemetry already enabled — skipping."
     return 0
   fi
 
   log_info "Current telemetry.enabled: '${current:-unset}' → true"
   # Need to disable captureOrganization, and group due to <https://redhat.atlassian.net/browse/CONNLINK-1300>
-  oc patch tenants.maas.opendatahub.io "$MAAS_TENANT_NAME" -n "$MAAS_TENANT_NS" \
+  oc patch maastenantconfigs.maas.opendatahub.io "$MAAS_TENANT_NAME" -n "$MAAS_TENANT_NS" \
     --type=merge -p '{
       "spec": {
         "telemetry": {
@@ -328,7 +345,7 @@ enable_maas_telemetry() {
         }
       }
     }'
-  log_ok "Tenant telemetry enabled (captureUser=true by default — see README for how to change)."
+  log_ok "MaaSTenantConfig telemetry enabled (captureUser=true by default — see README for how to change)."
 }
 
 enable_observability_dashboard() {
@@ -370,10 +387,13 @@ verify_observability_components() {
   [[ "$coo_csv" == "Succeeded" ]] && log_ok "COO: Succeeded" \
     || log_warn "COO CSV: ${coo_csv:-not found}"
 
-  # maas-controller auto-creates both of these itself once Tenant.spec.telemetry.enabled
-  # is true (Step 7) — this script never applies them directly. Confirmed live: deleting
-  # either one causes maas-controller to recreate it within ~45s via Server-Side Apply, so
-  # poll briefly rather than checking only once immediately after Step 7.
+  # maas-controller auto-creates both of these itself once MaaSTenantConfig.spec.telemetry.
+  # enabled is true (Step 7) — this script never applies them directly. Confirmed live:
+  # deleting either one causes maas-controller to recreate it within ~45s via Server-Side
+  # Apply, so poll briefly rather than checking only once immediately after Step 7. Note:
+  # after an RHOAI upgrade, a pre-existing TelemetryPolicy is NOT automatically refreshed to
+  # the new version's template on its own — only deleting it (letting it get recreated) or a
+  # genuinely fresh install picks up the current definition.
   local telemetry_wait_deadline=$(( $(date +%s) + 60 ))
   until resource_exists telemetrypolicies.extensions.kuadrant.io maas-telemetry "$GATEWAY_NS" \
       || (( $(date +%s) > telemetry_wait_deadline )); do
@@ -381,8 +401,29 @@ verify_observability_components() {
   done
   if resource_exists telemetrypolicies.extensions.kuadrant.io maas-telemetry "$GATEWAY_NS"; then
     log_ok "TelemetryPolicy 'maas-telemetry' exists in '${GATEWAY_NS}' (auto-created by maas-controller)."
+
+    # Cross-check what maas-controller actually generated against what this RHOAI version
+    # is expected to ship, rather than trusting the version number alone — the has() guard
+    # is a maas-controller behavior, not an RHOAI-operator-version guarantee per se (e.g. a
+    # TelemetryPolicy created under an older RHOAI version and never refreshed across an
+    # upgrade stays on its original, possibly-unguarded definition).
+    local org_id_expr
+    org_id_expr=$(oc get telemetrypolicies.extensions.kuadrant.io maas-telemetry -n "$GATEWAY_NS" \
+      -o jsonpath='{.spec.metrics.default.labels.organization_id}' 2>/dev/null)
+    if [[ "$org_id_expr" == *"has("* ]]; then
+      log_ok "TelemetryPolicy organization_id expression is has()-guarded — safe even without tokenMetadata set."
+      if ! rhoai_has_telemetry_cel_guard_fix; then
+        log_info "(Unexpected but fine: RHOAI ${RHOAI_MAJOR}.${RHOAI_MINOR}.${RHOAI_PATCH} predates the documented 3.4.4 fix version, yet the guard is already present.)"
+      fi
+    elif [[ -n "$org_id_expr" ]]; then
+      log_warn "TelemetryPolicy organization_id expression is NOT has()-guarded: ${org_id_expr}"
+      if rhoai_has_telemetry_cel_guard_fix; then
+        log_warn "(RHOAI ${RHOAI_MAJOR}.${RHOAI_MINOR}.${RHOAI_PATCH} is >= 3.4.4 and should have the guard — this object likely predates an upgrade and was never refreshed. Delete it and let maas-controller recreate it at the current template.)"
+      fi
+      log_warn "Every MaaSSubscription needs tokenMetadata.organizationId/costCenter set, or its usage report is silently dropped, until this is resolved."
+    fi
   else
-    log_warn "TelemetryPolicy 'maas-telemetry' not found in '${GATEWAY_NS}' after 60s — maas-controller should create this automatically once Tenant telemetry is enabled."
+    log_warn "TelemetryPolicy 'maas-telemetry' not found in '${GATEWAY_NS}' after 60s — maas-controller should create this automatically once MaaSTenantConfig telemetry is enabled."
   fi
 
   if resource_exists telemetry.telemetry.istio.io latency-per-subscription "$GATEWAY_NS"; then
@@ -396,7 +437,6 @@ verify_observability_components() {
   # costCenter unconditionally. Those are optional MaaSSubscription.spec.tokenMetadata
   # fields — if unset, the CEL evaluation error silently drops the ratelimit-report call to
   # Limitador for that subscription (request still succeeds; usage is just never counted).
-  # See ../KCS-MAAS-TELEMETRY-COSTCENTER-CEL.md for the full root cause and workaround.
   local subs_missing_metadata
   subs_missing_metadata=$(oc get maassubscription -A -o json 2>/dev/null \
     | python3 -c "
@@ -411,23 +451,28 @@ for item in data.get('items', []):
         print(f\"{item['metadata']['namespace']}/{item['metadata']['name']}\")
 " 2>/dev/null)
   if [[ -n "$subs_missing_metadata" ]]; then
-    log_warn "MaaSSubscription(s) without tokenMetadata.organizationId/costCenter set (Usage tab will show zero data for these until set):"
-    echo "$subs_missing_metadata" | while read -r s; do log_warn "  - ${s}"; done
-    log_warn "Fix: oc patch maassubscription <name> -n <namespace> --type=merge -p '{\"spec\":{\"tokenMetadata\":{\"organizationId\":\"<org>\",\"costCenter\":\"<cc>\"}}}'"
+    if rhoai_has_telemetry_cel_guard_fix; then
+      log_info "MaaSSubscription(s) without tokenMetadata.organizationId/costCenter set (optional on RHOAI ${RHOAI_MAJOR}.${RHOAI_MINOR}.${RHOAI_PATCH} — usage still counts, org/cost-center labels are just blank):"
+      echo "$subs_missing_metadata" | while read -r s; do log_info "  - ${s}"; done
+    else
+      log_warn "MaaSSubscription(s) without tokenMetadata.organizationId/costCenter set (Usage tab will show zero data for these on RHOAI ${RHOAI_MAJOR}.${RHOAI_MINOR}.${RHOAI_PATCH} until set — fixed upstream in 3.4.4+):"
+      echo "$subs_missing_metadata" | while read -r s; do log_warn "  - ${s}"; done
+    fi
+    log_info "Fix: oc patch maassubscription <name> -n <namespace> --type=merge -p '{\"spec\":{\"tokenMetadata\":{\"organizationId\":\"<org>\",\"costCenter\":\"<cc>\"}}}'"
   fi
 
   local kuadrant_obs tenant_telemetry dashboard_flag
   kuadrant_obs=$(oc get kuadrant kuadrant -n "$KUADRANT_NS" \
     -o jsonpath='{.spec.observability.enable}' 2>/dev/null)
-  tenant_telemetry=$(oc get tenants.maas.opendatahub.io "$MAAS_TENANT_NAME" -n "$MAAS_TENANT_NS" \
+  tenant_telemetry=$(oc get maastenantconfigs.maas.opendatahub.io "$MAAS_TENANT_NAME" -n "$MAAS_TENANT_NS" \
     -o jsonpath='{.spec.telemetry.enabled}' 2>/dev/null)
   dashboard_flag=$(oc get OdhDashboardConfig odh-dashboard-config -n "$RHOAI_APP_NS" \
     -o jsonpath='{.spec.dashboardConfig.observabilityDashboard}' 2>/dev/null)
 
   [[ "$kuadrant_obs" == "true" ]] && log_ok "Kuadrant observability.enable: true" \
     || log_warn "Kuadrant observability.enable: ${kuadrant_obs:-false}"
-  [[ "$tenant_telemetry" == "true" ]] && log_ok "Tenant telemetry.enabled: true" \
-    || log_warn "Tenant telemetry.enabled: ${tenant_telemetry:-false}"
+  [[ "$tenant_telemetry" == "true" ]] && log_ok "MaaSTenantConfig telemetry.enabled: true" \
+    || log_warn "MaaSTenantConfig telemetry.enabled: ${tenant_telemetry:-false}"
   [[ "$dashboard_flag" == "true" ]] && log_ok "OdhDashboardConfig observabilityDashboard: true" \
     || log_warn "OdhDashboardConfig observabilityDashboard: ${dashboard_flag:-false}"
 }
@@ -448,11 +493,22 @@ print_summary() {
     -o jsonpath='https://{.spec.host}' 2>/dev/null || echo 'see: oc get route -n redhat-ods-applications')"
   echo
   echo -e "  ${BOLD}Per-user metrics are ON by default${NC} (captureUser=true) — required for the"
-  echo -e "  Usage tab's per-user filtered queries to return data"
+  echo -e "  Usage tab's per-user filtered queries to return data at all (without it,"
+  echo -e "  maas-controller never adds a user label mapping to TelemetryPolicy). To disable"
+  echo -e "  (reduces Prometheus cardinality, loses per-user breakdown):"
+  echo -e "     oc patch maastenantconfigs.maas.opendatahub.io ${MAAS_TENANT_NAME} -n ${MAAS_TENANT_NS} \\"
+  echo -e "       --type=merge -p '{\"spec\":{\"telemetry\":{\"metrics\":{\"captureUser\":false}}}}'"
   echo
-  echo -e "  ${RED}${BOLD}Required for the Usage tab to show any data (on RHOAI <= 3.4.2):${NC} every"
-  echo -e "  MaaSSubscription needs spec.tokenMetadata.organizationId/costCenter set (Step 9 above"
-  echo -e "  lists any that don't). Fixed upstream for RHOAI 3.4.4+ (maas-controller PR #1276/#1311)"
+  if rhoai_has_telemetry_cel_guard_fix; then
+    echo -e "  ${BOLD}RHOAI ${RHOAI_MAJOR}.${RHOAI_MINOR}.${RHOAI_PATCH} has the maas-controller CEL guard fix (3.4.4+,"
+    echo -e "  PR #1276/#1311):${NC} MaaSSubscription.spec.tokenMetadata.organizationId/costCenter is genuinely"
+    echo -e "  optional — a subscription without it still counts usage, just with blank org/cost-center labels."
+    echo -e "  Still good practice to set it for meaningful showback attribution (Step 9 above lists any that don't):"
+  else
+    echo -e "  ${RED}${BOLD}RHOAI ${RHOAI_MAJOR}.${RHOAI_MINOR}.${RHOAI_PATCH} predates the 3.4.4 CEL guard fix — REQUIRED for the"
+    echo -e "  Usage tab to show any data:${NC} every MaaSSubscription needs spec.tokenMetadata.organizationId/"
+    echo -e "  costCenter set, or its usage report is silently dropped (Step 9 above lists any that don't):"
+  fi
   echo -e "     oc patch maassubscription <name> -n <namespace> --type=merge \\"
   echo -e "       -p '{\"spec\":{\"tokenMetadata\":{\"organizationId\":\"<org>\",\"costCenter\":\"<cc>\"}}}'"
   echo
@@ -477,7 +533,7 @@ main() {
 
   echo
   echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${CYAN}║   RHOAI 3.4 MaaS — Observability Dashboard Automation Setup   ║${NC}"
+  echo -e "${BOLD}${CYAN}║   RHOAI 3  MaaS — Observability Dashboard Automation Setup   ║${NC}"
   echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
   echo
 

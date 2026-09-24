@@ -56,20 +56,9 @@ Provides the `OpenTelemetryCollector` CRD. Without it the Monitoring controller 
 
 ### Step 4 — Install Cluster Observability Operator (COO)
 Provides the Perses CRDs (`Perses`, `PersesDatasource`, `PersesDashboard`) that back the
-Observability Dashboard tab in the RHOAI UI. RHOAI version is auto-detected (same approach
-as `../setup-maas.sh`) to pick one of two subscriptions:
-
-- **RHOAI < 3.4.3**: pinned to `v1.4.0` with **Manual** install-plan approval
-  (`manifests/operators/coo/subscription.yaml`) — avoids a regression in newer COO releases.
-  `setup.sh` auto-approves the resulting InstallPlan via `approve_installplan_for_sub`
-  (from `../lib/common.sh`).
-- **RHOAI 3.4.3+**: tracks the `stable` channel's latest CSV with **Automatic** approval
-  (`manifests/operators/coo/subscription-latest.yaml`) — RHOAI 3.4.3+ is confirmed
-  compatible with newer COO releases, so the pin is no longer needed.
-
-This only takes effect on a fresh COO install — if COO is already installed and its CSV is
-already `Succeeded`, this step skips entirely regardless of which subscription it would
-have chosen (same idempotent-skip behavior as every other operator install in this repo).
+Observability Dashboard tab in the RHOAI UI. Pinned to `v1.4.0` with **Manual** install-plan
+approval (avoids regressions in newer COO releases) — `setup.sh` auto-approves the resulting
+InstallPlan via `approve_installplan_for_sub` (from `../lib/common.sh`).
 
 ### Step 5 — Enable DSCI monitoring
 Patches `DSCInitialization/default-dsci` with `spec.monitoring.metrics` (5Gi storage, 90-day
@@ -82,10 +71,15 @@ Patches `Kuadrant/kuadrant` → `spec.observability.enable: true`, which creates
 so Prometheus scrapes token-consumption/rate-limit metrics from Limitador.
 
 ### Step 7 — Enable MaaS gateway telemetry
-Patches `Tenant/default-tenant` → `spec.telemetry.enabled: true`. `captureUser` is **true by
+Patches `MaaSTenantConfig/default-tenant` → `spec.telemetry.enabled: true`. (Not the similarly
+named `Tenant` CRD — that one exists on the cluster but has no live instances; `MaaSTenantConfig`
+is what `maas-controller` actually reconciles against. This script previously targeted the wrong
+CRD, a no-op patch against a nonexistent object, silently doing nothing — fixed after a real
+customer resolution surfaced it.)
+`captureUser` is **true by
 default** — required for the Usage tab's per-user filtered queries to return any data at all
 (without it, `maas-controller` never adds a `user` label mapping to `TelemetryPolicy`, so every
-per-user query the dashboard runs comes back empty.
+per-user query the dashboard runs comes back empty).
 Set it back to `false` if you'd rather trade that off for lower Prometheus cardinality — see
 [Disabling per-user metrics](#disabling-per-user-metrics) below.
 
@@ -94,7 +88,9 @@ the RHOAI application, not this script) auto-generates `TelemetryPolicy/maas-tel
 (Kuadrant) and `Telemetry/latency-per-subscription` (Istio) the moment this flag is true. This
 module used to apply its own copies of those two CRs directly; that step was removed because
 `maas-controller` owns and reconciles them regardless (confirmed live: it recreates them within
-~45s of deletion), making a separate apply redundant. 
+~45s of deletion), making a separate apply redundant. Note there's a known gap in what
+`maas-controller` generates by default (an unguarded CEL expression that can silently drop
+usage reporting) — not fixable from this repo; see the tokenMetadata guidance below.
 
 ### Step 8 — Enable the dashboard tab
 Patches `OdhDashboardConfig/odh-dashboard-config` → `spec.dashboardConfig.observabilityDashboard:
@@ -103,7 +99,8 @@ true`, which surfaces Observe & monitor → Dashboard → **Usage** tab in the R
 ### Step 9 — Verify
 Checks all 3 operator CSVs are `Succeeded`, that `maas-controller` has created both telemetry
 CRs (polls up to 60s, since creation is asynchronous), that all 3 CR patches took effect, and
-lists any `MaaSSubscription` missing `spec.tokenMetadata.organizationId`/`costCenter`
+lists any `MaaSSubscription` missing `spec.tokenMetadata.organizationId`/`costCenter` — that
+field is required (on RHOAI < 3.4.4) for the Usage tab to show data for a given subscription.
 
 ## Disabling per-user metrics
 
@@ -111,7 +108,7 @@ lists any `MaaSSubscription` missing `spec.tokenMetadata.organizationId`/`costCe
 per-user breakdown in the Usage tab for lower Prometheus cardinality:
 
 ```bash
-oc patch tenants.maas.opendatahub.io default-tenant -n models-as-a-service \
+oc patch maastenantconfigs.maas.opendatahub.io default-tenant -n models-as-a-service \
   --type=merge -p '{"spec":{"telemetry":{"metrics":{"captureUser":false}}}}'
 ```
 
@@ -142,9 +139,7 @@ maas-observability/
     └── operators/
         ├── tempo/{namespace,operatorgroup,subscription}.yaml
         ├── opentelemetry/{namespace,operatorgroup,subscription}.yaml
-        └── coo/{namespace,operatorgroup,subscription,subscription-latest}.yaml
-            # subscription.yaml: pinned v1.4.0, Manual approval (RHOAI < 3.4.3)
-            # subscription-latest.yaml: stable channel, Automatic approval (RHOAI 3.4.3+)
+        └── coo/{namespace,operatorgroup,subscription}.yaml
 ```
 
 (No `telemetry/` manifests here — `TelemetryPolicy`/`Telemetry` are auto-created by
@@ -174,10 +169,12 @@ oc get crd perses.perses.dev
 ```
 
 ### Usage tab shows no data
-- Confirm `Kuadrant.spec.observability.enable` and `Tenant.spec.telemetry.enabled` are both
-  `true` (Step 9's verification output, or re-check with `oc get`).
+- Confirm `Kuadrant.spec.observability.enable` and `MaaSTenantConfig.spec.telemetry.enabled`
+  are both `true` (Step 9's verification output, or re-check with `oc get`).
 - Confirm every `MaaSSubscription` you expect to see data for has `spec.tokenMetadata.
-  organizationId`/`costCenter` set (Step 9's verification lists any that don't).
+  organizationId`/`costCenter` set (Step 9's verification lists any that don't) — required,
+  not optional despite being an optional CRD field, on RHOAI < 3.4.4 (see
+  [below](#scraping-confirmed-working-but-still-no-data-check-limitadors-own-metrics)).
 - No data is expected until users actually make requests to MaaS models — send a test chat
   completion request, then re-check.
 - The Usage tab does **not** read from the Tempo/OTel/COO stack this script installs (that
@@ -286,14 +283,14 @@ patching, `authorized_calls`/`authorized_hits` appear in Limitador's `/metrics`,
 labeled, and the Usage tab populates. `setup.sh`'s Step 9 lists any `MaaSSubscription` missing
 this field.
 
-**Already fixed upstream, not yet GA:** confirmed via
+**Fixed upstream in RHOAI 3.4.4+:** confirmed via
 [PR #1276](https://github.com/opendatahub-io/models-as-a-service/pull/1276)/
 [#1311](https://github.com/opendatahub-io/models-as-a-service/pull/1311)/
 [#1312](https://github.com/opendatahub-io/models-as-a-service/pull/1312) in
 `opendatahub-io/models-as-a-service` — the exact `has()`-guard fix, already merged (including a
-`release-3.4` backport). It lands in RHOAI **3.4.4**, which is not yet released — current GA is
-**3.4.2**. Until you're on a build that includes the fix, the `tokenMetadata` workaround above
-is required.
+`release-3.4` backport). Below RHOAI 3.4.4, `tokenMetadata` is effectively required for a
+subscription's usage to be counted at all; from 3.4.4 on, it's genuinely optional (missing
+values just mean blank `organization_id`/`cost_center` labels, not a dropped usage report).
 
 ### Cardinality / Prometheus growth from `captureUser`
 `captureUser` is on by default (Step 7) — see [Disabling per-user

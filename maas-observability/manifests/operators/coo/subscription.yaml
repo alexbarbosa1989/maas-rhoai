@@ -3,9 +3,9 @@
 # regressions in newer COO releases. install_coo() in setup.sh approves the
 # resulting InstallPlan automatically via approve_installplan_for_sub.
 #
-# Only used when the cluster's RHOAI version is below 3.4.3 — install_coo() switches to
-# subscription-latest.yaml (stable channel, Automatic approval) on RHOAI 3.4.3+, once the
-# regression this pin works around is confirmed fixed upstream.
+# Only used on RHOAI < 3.5.0 — the pin is needed for the entire 3.4.x line.
+# install_coo() switches to subscription-latest.yaml (stable channel, Automatic
+# approval) on RHOAI 3.5.0+, where the regression this pin works around is fixed.
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
