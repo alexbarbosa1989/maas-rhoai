@@ -104,10 +104,23 @@ oc login https://api.<cluster>.<domain>:443 \
 # 3. Run the automation (installs everything end-to-end, including MetalLB on non-cloud)
 ./setup-maas.sh
 
-# 4. Optionally deploy the example LLMInferenceService and MaaS governance
-#    (MaaSModelRef/MaaSSubscription/MaaSAuthPolicy)
+# 4. Optionally deploy an example workload: an LLMInferenceService (llama-3.1-8B FP8,
+#    needs a GPU node) plus its MaaS governance (MaaSModelRef/MaaSSubscription/
+#    MaaSAuthPolicy) — publishes it behind the gateway with a working quota/auth
+#    policy, ready to call. Prints copy-paste-ready commands to mint an API key and
+#    call the model when it finishes.
 ./deploy-example-workload.sh
 ```
+
+`deploy-example-workload.sh` is deliberately a separate script from `setup-maas.sh` — the
+platform layer (operators, gateway, Authorino TLS, DSC/dashboard flags) is close to one-shot,
+while this example workload is something you'll likely redeploy, tweak, or tear down
+independently many times. Re-running it is idempotent. If your cluster's GPU
+`HardwareProfile` isn't named `local-gpu` (the manifest's default), pass
+`--hardware-profile-name <name>` or see `./deploy-example-workload.sh --help`. Once it
+completes, see [Deploying your own model](#deploying-your-own-model) below to walk through
+the same steps by hand for a model of your own, or [Call the API, §3](#3-call-the-api) for
+the exact `curl` commands against the example model it just deployed.
 
 ### Flags
 
