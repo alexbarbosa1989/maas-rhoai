@@ -115,9 +115,10 @@ oc login https://api.<cluster>.<domain>:443 \
 `deploy-example-workload.sh` is deliberately a separate script from `setup-maas.sh` — the
 platform layer (operators, gateway, Authorino TLS, DSC/dashboard flags) is close to one-shot,
 while this example workload is something you'll likely redeploy, tweak, or tear down
-independently many times. Re-running it is idempotent. If your cluster's GPU
-`HardwareProfile` isn't named `local-gpu` (the manifest's default), pass
-`--hardware-profile-name <name>` or see `./deploy-example-workload.sh --help`. Once it
+independently many times. Re-running it is idempotent. It auto-detects a GPU
+`HardwareProfile` in your cluster, or creates a minimal one named `nvidia-gpu` if none
+exists; pass `--hardware-profile-name <name>` to use a specific one instead, or see
+`./deploy-example-workload.sh --help`. Once it
 completes, see [Deploying your own model](#deploying-your-own-model) below to walk through
 the same steps by hand for a model of your own, or [Call the API, §3](#3-call-the-api) for
 the exact `curl` commands against the example model it just deployed.

@@ -82,8 +82,9 @@ to mint one.
 HardwareProfile resolution order for step 1 (opendatahub.io/hardware-profile-name annotation):
   1. --hardware-profile-name / HARDWARE_PROFILE_NAME, if set
   2. First HardwareProfile in RHOAI_APP_NS with an nvidia.com/gpu identifier, if any
-  3. Falls back to the manifest default ('local-gpu') with a warning — the annotation is
-     informational only; scheduling is driven by the resource requests in the manifest.
+  3. Creates a minimal HardwareProfile named 'nvidia-gpu' in RHOAI_APP_NS (cpu, memory,
+     nvidia.com/gpu identifiers) and uses that — the annotation is informational only;
+     scheduling is driven by the resource requests in the manifest.
 
 Prerequisites (created by setup-maas.sh):
   - Namespace 'maas-models' must exist
@@ -158,12 +159,13 @@ deploy_llminferenceservice() {
     if [[ -n "$RESOLVED_HW_PROFILE" ]]; then
       log_ok "Auto-detected GPU HardwareProfile '${RESOLVED_HW_PROFILE}' in '${RHOAI_APP_NS}'."
     else
-      RESOLVED_HW_PROFILE="local-gpu"
+      RESOLVED_HW_PROFILE="nvidia-gpu"
       log_warn "No GPU HardwareProfile found in '${RHOAI_APP_NS}' and none provided via --hardware-profile-name."
-      log_warn "Falling back to manifest default '${RESOLVED_HW_PROFILE}' — this annotation is informational"
-      log_warn "only (scheduling is driven by resource requests), but won't match a real profile in the dashboard."
-      log_warn "Pass --hardware-profile-name <name> once you've created one, or after checking:"
-      log_warn "  oc get hardwareprofile -n ${RHOAI_APP_NS}"
+      log_info "Creating HardwareProfile '${RESOLVED_HW_PROFILE}' in '${RHOAI_APP_NS}' (cpu, memory, nvidia.com/gpu)…"
+      if ! create_gpu_hardware_profile "$RHOAI_APP_NS" "$RESOLVED_HW_PROFILE"; then
+        exit 1
+      fi
+      log_ok "Created HardwareProfile '${RESOLVED_HW_PROFILE}' in '${RHOAI_APP_NS}'."
     fi
   fi
 

@@ -167,3 +167,51 @@ for p in profiles:
         break
 " 2>/dev/null
 }
+
+# create_gpu_hardware_profile NAMESPACE NAME
+# Creates a minimal single-GPU HardwareProfile (infrastructure.opendatahub.io/v1,
+# cpu + memory + nvidia.com/gpu identifiers) in the given namespace if one by that
+# name doesn't already exist. Idempotent — safe to call on every run.
+create_gpu_hardware_profile() {
+  local ns="$1" name="$2"
+  if resource_exists hardwareprofile "$name" "$ns"; then
+    return 0
+  fi
+  local out
+  if ! out=$(oc apply -f - 2>&1 <<EOF
+apiVersion: infrastructure.opendatahub.io/v1
+kind: HardwareProfile
+metadata:
+  name: ${name}
+  namespace: ${ns}
+  annotations:
+    opendatahub.io/display-name: ${name}
+    opendatahub.io/description: "Auto-created by deploy-example-workload.sh — minimal profile for a single-GPU workload."
+    opendatahub.io/disabled: "false"
+spec:
+  identifiers:
+    - identifier: cpu
+      displayName: CPU
+      resourceType: CPU
+      defaultCount: 1
+      minCount: 1
+      maxCount: 4
+    - identifier: memory
+      displayName: Memory
+      resourceType: Memory
+      defaultCount: 4Gi
+      minCount: 2Gi
+      maxCount: 8Gi
+    - identifier: nvidia.com/gpu
+      displayName: NVIDIA GPU
+      resourceType: Accelerator
+      defaultCount: 1
+      minCount: 1
+      maxCount: 1
+EOF
+  ); then
+    log_error "Failed to create HardwareProfile '${name}' in '${ns}': ${out}"
+    return 1
+  fi
+  return 0
+}
